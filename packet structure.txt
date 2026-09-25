@@ -1,0 +1,62 @@
+
+┌──────────┬──────────┬──────────┬──────────────┐
+│ type     │ length   │ seq      │ timestamp    │
+│ uint8    │ uint16   │ uint32   │ int64        │
+└──────────┴──────────┴──────────┴──────────────┘
+  1 byte     2 bytes    4 bytes      8 bytes
+
+15B header
+┌──────────────┬──────────────┐
+│ ltpDelta     │ int64        │
+│ openDelta    │ int64        │
+│ highDelta    │ int64        │
+│ lowDelta     │ int64        │
+│ closeDelta   │ int64        │
+│ volumeDelta  │ int64        │
+└──────────────┴──────────────┘
+
+
+DEPTH_DELTA 
+15B header
+
+20 × int32
+----------------
+bid[0] delta
+bid[1] delta
+...
+bid[9] delta
+
+ask[0] delta
+ask[1] delta
+...
+ask[9] delta
+
+80 bytes
+
+
+TRADE_UPDATE
+├── Header
+│   ├── type        1 B
+│   ├── length      2 B
+│   ├── seq         4 B
+│   └── timestamp   8 B
+│
+├── LTP             8 B
+│
+└── 10 trades ×
+    ├── priceDelta  4 B
+    ├── quantity    4 B
+    └── timeDelta   4 B
+
+Header        = 15 B
+LTP           =  8 B
+10 trades     = 10 × 12 = 120 B
+--------------------------------
+Total         = 144 bytes
+
+
+
+
+CHART_DELTA: 15 + 48 = 63 bytes
+DEPTH_DELTA: 15 + 80 = 95 bytes
+TRADE_UPDATE: 15 + 8 + 120 = 143 bytes

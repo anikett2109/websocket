@@ -1,0 +1,1240 @@
+You are implementing the BACKEND for a Full Stack Engineer assignment: Build a Real-Time Cryptocurrency Trading Web App.
+
+First inspect the existing repository and preserve its current conventions where reasonable. Do not introduce unnecessary infrastructure. This is an assignment, so prioritize correctness, clarity, deterministic behavior, low latency, testability, and ease of explanation in an interview.
+
+1. Fixed technology choices
+Use:
+
+Go
+
+Gin for REST APIs
+
+WebSocket using a standard Go WebSocket library such as gorilla/websocket
+
+In-memory state/cache only
+
+Goroutines + channels for concurrent market-data processing
+
+No Kafka
+
+No Redis
+
+No PostgreSQL
+
+No external market-data provider
+
+The entire backend must run as one lightweight service/process.
+
+The backend should expose:
+
+REST HTTP server
+WebSocket server
+Synthetic market-data generator
+Market-data processor
+Candle engine
+Order-book engine
+In-memory cache
+WebSocket client manager
+Keep responsibilities separated into packages/modules.
+
+Suggested structure:
+
+cmd/server/
+
+internal/
+    model/
+    generator/
+    market/
+    candle/
+    orderbook/
+    cache/
+    websocket/
+    protocol/
+    api/
+    client/
+    
+tests/
+Do not blindly follow this structure if the repository already has a clean structure.
+
+2. Overall architecture
+Implement this flow:
+
+Synthetic Trade Generator
+        |
+        | complete trade stream
+        v
+Trade Ingestor / Market Processor
+        |
+        +--------------------------+
+        |                          |
+        v                          v
+Candle Engine                Recent Trade Store
+        |                          |
+        |                          |
+        +------------+-------------+
+                     |
+                     v
+               Market State
+                     |
+          +----------+----------+
+          |                     |
+          v                     v
+     Candle Cache        REST / Recovery
+          
+Synthetic Depth Generator
+        |
+        v
+Order Book Engine
+        |
+        +------------------------+
+        |                        |
+        v                        v
+   Book State              REST Snapshot
+        |
+        v
+   Live Depth Stream
+        |
+        v
+    WebSocket Server
+The critical architectural separation is:
+
+MARKET PROCESSOR
+= decides what happened
+
+WEBSOCKET SERVER
+= decides when each client receives it
+The WebSocket server must NOT calculate candles itself.
+
+The WebSocket server must NOT become the canonical order-book source.
+
+The canonical market state is maintained by the market-processing components.
+
+3. Synthetic trade generator
+Generate one symbol only:
+
+BTCUSDT
+Make the generator deterministic/repeatable using a fixed random seed configurable through environment variables.
+
+Generate one trade approximately every:
+
+50 ms
+Therefore the normal generated trade rate is approximately:
+
+20 trades/second
+Do not require an exact number every second; use the timer as the generation cadence and allow deterministic pseudo-random variation in price/quantity.
+
+Each trade must contain:
+
+tradeId       uint32/uint64
+timestamp     int64
+price         fixed-point integer
+quantity      fixed-point integer
+tradeId must be monotonically increasing and is the unambiguous ordering identifier required by the assignment.
+
+Do NOT use floating-point for prices/quantities internally.
+
+Use fixed-point integers.
+
+For example:
+
+actual price × 1e8
+actual quantity × 1e8
+Create plausible price movement using a deterministic random walk.
+
+Maintain:
+
+latestPrice
+latestTradeQuantity
+tradeId
+4. Trade ingestor / market processor
+The trade generator must publish generated trades into an internal channel.
+
+The market processor consumes trades continuously.
+
+Do not wait for WebSocket timers before processing trades.
+
+Every generated trade must immediately update:
+
+latest LTP
+latest LTQ
+recent trades
+active 1m candle
+active 5m candle
+The processor must always calculate the complete market state regardless of the client's WebSocket tier.
+
+Client tiers must NEVER change the market calculation.
+
+5. Candle engine
+Maintain two intervals:
+
+1m
+5m
+Maintain enough historical candles for REST, e.g. 500 candles per interval.
+
+On startup, generate deterministic historical candle data so the frontend has something to display immediately.
+
+Then continue live candle calculation from generated trades.
+
+For every trade:
+
+open
+high
+low
+close
+volume
+must be updated correctly.
+
+For an active candle:
+
+open = first trade price
+high = max(high, trade price)
+low = min(low, trade price)
+close = latest trade price
+volume += trade quantity
+When the interval closes, finalize the candle and create the next candle.
+
+Maintain a separate monotonically increasing:
+
+chartSeq
+for each interval or, preferably, one chart stream sequence if implementation remains simple.
+
+Every canonical chart state transition increments the chart sequence.
+
+Example:
+
+chartSeq 100
+chartSeq 101
+chartSeq 102
+...
+The WebSocket client does not receive every state necessarily. It receives a coalesced delta from one canonical state to another depending on its tier.
+
+6. In-memory candle cache
+Maintain:
+
+CandleCache
+conceptually:
+
+interval -> ring buffer of candles
+
+1m -> recent candles + active candle
+5m -> recent candles + active candle
+Each active candle should retain the latest canonical state and sequence.
+
+The cache is the source for REST history and initial snapshots.
+
+7. Synthetic order-book generator
+Maintain a plausible order book with:
+
+10 bids
+10 asks
+Use a fixed tick size.
+
+The order book should remain around the simulated market price.
+
+Generate depth changes approximately every:
+
+50 ms
+or occasionally at 100 ms depending on deterministic randomization.
+
+Each depth mutation should modify quantities and occasionally modify levels while preserving:
+
+bestBid < bestAsk
+and maintaining at least:
+
+10 bids
+10 asks
+The implementation must remain deterministic/repeatable.
+
+8. Order-book engine
+Maintain the authoritative server-side order book.
+
+Maintain:
+
+bids
+asks
+depthSeq
+depthSeq is a monotonically increasing sequence specifically for the depth stream.
+
+Every canonical depth update increments depthSeq.
+
+Example:
+
+depthSeq:
+5001
+5002
+5003
+...
+The server-side book is authoritative.
+
+9. REST order-book snapshot
+Expose:
+
+GET /api/orderbook/snapshot?symbol=BTCUSDT
+Return:
+
+{
+  "symbol": "BTCUSDT",
+  "seq": 5000,
+  "ltp": 65000,
+  "ltq": 20,
+  "bids": [
+    {"price": 65000, "qty": 2.5}
+  ],
+  "asks": [
+    {"price": 65001, "qty": 1.8}
+  ]
+}
+The snapshot contains complete current state.
+
+The frontend stores:
+
+lastDepthSeq = snapshot.seq
+10. REST candle API
+Expose:
+
+GET /api/candles?symbol=BTCUSDT&interval=1m&limit=200
+GET /api/candles?symbol=BTCUSDT&interval=5m&limit=200
+Response should include:
+
+candles
+active candle
+current canonical chart sequence
+latest LTP
+The sequence is important because the frontend needs a base state before applying WebSocket deltas.
+
+Handle:
+
+invalid interval
+empty history
+invalid limit
+cleanly.
+
+11. REST trades API
+Expose historical/range access:
+
+GET /api/trades?symbol=BTCUSDT&from=<timestamp>&to=<timestamp>&limit=200
+Maintain a bounded in-memory trade ring buffer sufficient for recent history.
+
+The WebSocket screen only needs the latest 10 trades.
+
+REST is used for arbitrary time-range trade history.
+
+12. Recent trades cache
+Maintain a bounded ring buffer such as:
+
+last 1000 trades
+Every generated trade is inserted.
+
+The WebSocket live trade packet does NOT stream every generated trade individually.
+
+Instead, whenever the trade delivery timer fires, send:
+
+latest 10 trades
+ordered newest-first.
+
+The assignment only requires recent trades on the trading screen.
+
+13. WebSocket architecture
+Maintain one WebSocket connection per browser client.
+
+Create a central:
+
+ClientManager
+responsible for:
+
+connected clients
+RTT
+RTTVAR
+effective latency score
+current tier
+tier hysteresis
+tier override
+flush schedules
+connection lifecycle
+The market publishers should remain separate:
+
+ChartPublisher
+DepthPublisher
+TradePublisher
+All three use the same client state maintained by ClientManager.
+
+14. Client state
+Maintain something conceptually like:
+
+type ClientState struct {
+    ConnectionID string
+
+    Tier Tier
+
+    TierOverride TierOverride
+
+    SRTT time.Duration
+    RTTVAR time.Duration
+    EffectiveLatency time.Duration
+
+    LastRTT time.Duration
+    ConsecutiveDemotionSamples int
+    ConsecutivePromotionSamples int
+
+    LastChartSeq uint32
+    LastDepthSeq uint32
+    LastTradeID uint32
+
+    NextChartFlush time.Time
+    NextDepthFlush time.Time
+    NextTradeFlush time.Time
+
+    ConnectedAt time.Time
+}
+Do not allow publishers to independently change a client's tier.
+
+Only ClientManager changes tier.
+
+15. RTT / jitter measurement
+The server sends an application-level PING every:
+
+1 second
+PING and PONG use the same 15-byte packet structure defined below.
+
+Server sends:
+
+probeSeq
+timestamp
+Client returns the same probe sequence and timestamp in PONG.
+
+Server calculates:
+
+RTT = receiveTime - originalSendTimestamp
+Maintain TCP-style smoothed estimates:
+
+SRTT
+RTTVAR
+Use:
+
+alpha = 1/8
+beta = 1/4
+Formula:
+
+SRTT_n =
+    (1-alpha) * SRTT_(n-1)
+    + alpha * RTT_n
+and:
+
+RTTVAR_n =
+    (1-beta) * RTTVAR_(n-1)
+    + beta * abs(SRTT_(n-1) - RTT_n)
+Then define a single client network-quality score:
+
+EffectiveLatency =
+    SRTT + 4 * RTTVAR
+This is inspired by the established TCP RTT/RTO estimator described in RFC 6298, but the tier thresholds below are our application-specific design.
+
+Perform a short warmup, e.g. 5 valid probes, before automatic classification.
+
+16. Delivery tiers
+Use exactly three tiers:
+
+FULL
+DEGRADED
+MINIMAL
+Classify based on:
+
+EffectiveLatency = SRTT + 4*RTTVAR
+Use:
+
+FULL:
+E < 100 ms
+
+DEGRADED:
+100 ms <= E < 250 ms
+
+MINIMAL:
+E >= 250 ms
+These thresholds are intentionally application-defined because the assignment leaves tier thresholds to us.
+
+The justification is to make delivery visibly different in the demo while gradually reducing delivery frequency as effective network uncertainty increases.
+
+17. Hysteresis
+Do NOT switch tier on one probe.
+
+Demotion:
+
+FULL -> DEGRADED
+E >= 100 ms for 3 consecutive valid probes
+
+DEGRADED -> MINIMAL
+E >= 250 ms for 3 consecutive valid probes
+Promotion:
+
+MINIMAL -> DEGRADED
+E < 200 ms for 5 consecutive valid probes
+
+DEGRADED -> FULL
+E < 80 ms for 5 consecutive valid probes
+Reset the consecutive counter when the condition stops being true.
+
+This prevents tier flapping.
+
+18. Missing PONG / unhealthy connection
+If heartbeat responses stop arriving:
+
+~3 seconds without valid probe response:
+mark client degraded
+
+~6 seconds without valid response:
+mark client minimal / unhealthy
+
+WebSocket closed:
+mark disconnected
+On disconnection:
+
+close client state
+stop timers
+stop goroutines associated with client
+release subscriptions
+The frontend must show cached values as stale while disconnected.
+
+19. Adaptive packet delivery rates
+Use these exact initial delivery policies:
+
+Tier	Depth	Chart	Trades
+FULL	50 ms	100 ms	250 ms
+DEGRADED	100 ms	250 ms	500 ms
+MINIMAL	250 ms	1000 ms	2000 ms
+The ordering intentionally satisfies:
+
+Depth frequency > Chart frequency > Trade frequency
+These are delivery rates, NOT market-generation rates.
+
+The market engine keeps processing every generated event at all tiers.
+
+20. Important distinction: canonical state vs delivery
+Never do:
+
+MINIMAL client
+-> process fewer trades
+-> compute candle differently
+Instead:
+
+All generated trades
+    |
+    v
+Canonical candle
+    |
+    +-- Full -> frequent delivery
+    +-- Degraded -> slower delivery
+    +-- Minimal -> slower delivery
+All clients eventually receive the same final candle OHLCV.
+
+21. Packet protocol
+Use binary WebSocket messages.
+
+Do NOT add unnecessary production fields such as:
+
+version
+flags
+reserved
+request IDs
+checksums
+The assignment does not need them.
+
+Use a common 15-byte header:
+
+1 byte   type
+2 bytes  length
+4 bytes  seq
+8 bytes  timestamp
+Total:
+
+15 bytes
+Serialize manually with encoding/binary; do not use unsafe struct memory layouts because Go alignment/padding must not affect the wire format.
+
+Use little-endian consistently.
+
+length should represent the complete application packet length.
+
+Packet types:
+
+1 = CHART_DELTA
+2 = DEPTH_DELTA
+3 = TRADE_UPDATE
+4 = PING
+5 = PONG
+22. CHART_DELTA packet
+Fixed packet size:
+
+15 byte header
++
+6 × int64
+Fields:
+
+ltpDelta
+openDelta
+highDelta
+lowDelta
+closeDelta
+volumeDelta
+Payload:
+
+48 bytes
+Total:
+
+63 bytes
+Chart sequence is canonical chartSeq.
+
+The packet describes a transition:
+
+baseSeq -> seq
+and the effective delta is relative to the client's last known chart state.
+
+A chart packet must include enough information in the header timestamp to identify the active candle.
+
+For chart packets, interpret:
+
+timestamp = candle start timestamp
+The frontend keeps local candle state and applies deltas.
+
+If there is no market change, do not manufacture a chart packet with all-zero deltas.
+
+If a new candle starts, initialize the new candle correctly; do not apply the new candle's initial values as though they were deltas to the previous candle.
+
+23. CHART sequence semantics
+This is critical.
+
+The market/candle engine owns the canonical chart sequence.
+
+WebSocket does not create a separate sequence space per client tier.
+
+Example:
+
+Canonical:
+1,2,3,4,5,6,7,8,9,10
+FULL client may receive:
+
+base 0 -> seq 1
+base 1 -> seq 2
+base 2 -> seq 3
+...
+DEGRADED client may receive:
+
+base 5 -> seq 10
+because states 6-10 were coalesced into one net delta.
+
+The key invariant is:
+
+clientLocalSeq == packet.baseSeq
+before applying a delta.
+
+If base sequence does not match local sequence:
+
+reject delta
+request fresh REST snapshot
+replace local state
+resume
+For the assignment, include baseSeq in the logical metadata used by the chart synchronization implementation. If it must be encoded without increasing the agreed fixed packet size, document a consistent way to derive/store it at the session layer rather than adding unnecessary protocol fields.
+
+Do not create a new sequence namespace when the client changes tier.
+
+Changing tier changes only delivery frequency.
+
+24. DEPTH_DELTA packet
+REST snapshot is the base state.
+
+Depth WebSocket messages contain only incremental changes.
+
+Agreed packet size:
+
+15 byte header
++
+20 × int32
+=
+95 bytes
+The 20 int32 slots represent:
+
+bid[0] delta
+bid[1] delta
+...
+bid[9] delta
+
+ask[0] delta
+ask[1] delta
+...
+ask[9] delta
+The 10 levels have predefined offsets.
+
+The snapshot establishes the absolute price levels.
+
+Normal depth updates only transmit quantity changes for these levels.
+
+Use fixed-point integer quantity deltas.
+
+For zero quantity after applying the delta, remove the level.
+
+The order-book engine must maintain at least 10 bids and 10 asks.
+
+depthSeq is canonical.
+
+If the frontend receives:
+
+1001
+1002
+1004
+it detects the missing state and requests:
+
+GET /api/orderbook/snapshot
+Then replaces the local book using the returned snapshot sequence.
+
+While snapshot recovery is in flight, buffer incoming depth deltas rather than applying them blindly.
+
+After the snapshot returns, replay only deltas whose base state matches the snapshot; if synchronization still cannot be established, request another snapshot.
+
+25. TRADE_UPDATE packet
+The screen displays only the latest 10 trades.
+
+Every trade packet sends the latest 10 trades.
+
+Fixed binary layout:
+
+15 byte header
+8 byte LTP
+10 trades ×:
+    4 byte priceDelta
+    4 byte quantity
+    4 byte timeDelta
+No trade-count field because it is always exactly 10.
+
+Total:
+
+15 + 8 + 120
+=
+143 bytes
+Use:
+
+LTP = packet-level reference price
+
+price = LTP + priceDelta
+
+timestamp = packet timestamp + timeDelta
+
+quantity = absolute fixed-point quantity
+Do NOT calculate quantity relative to LTQ; LTQ is the latest trade quantity and is not a good reference for historical trades.
+
+tradeId remains the canonical unambiguous ordering identifier for generated trades. If the agreed fixed trade packet size cannot include it for all 10 trades, keep ordering deterministic through the server's recent-trade buffer and document the limitation clearly; do not invent unnecessary protocol complexity.
+
+The live screen is intentionally not a lossless infinite trade log.
+
+For arbitrary historical/range trade viewing, use REST.
+
+26. PING / PONG packets
+Both are:
+
+15 bytes
+Layout:
+
+type    uint8
+length  uint16
+seq     uint32
+time    int64
+PING:
+
+seq = probeSeq
+timestamp = server send time
+PONG copies:
+
+seq = probeSeq
+timestamp = original ping timestamp
+Server calculates:
+
+RTT = currentServerTime - pong.timestamp
+27. Trade delivery flow
+Every generated trade goes through:
+
+Generator
+   |
+   v
+Trade Ingestor
+   |
+   +--> candle engine
+   +--> recent trade ring buffer
+   +--> latest LTP/LTQ
+The WebSocket does NOT wait for the generator.
+
+Every trade is processed immediately.
+
+Then each client has a timer according to its tier.
+
+At trade flush time:
+
+take latest 10 trades
+serialize
+send TRADE_UPDATE
+If no trade has arrived since the last delivery, do not unnecessarily send identical trade data.
+
+28. Chart delivery flow
+Canonical candle state changes continuously.
+
+Each client has:
+
+nextChartFlush
+according to tier.
+
+At flush:
+
+current canonical chart state
+-
+last client-delivered chart state
+=
+delta
+Send only the delta.
+
+This means:
+
+FULL:
+state 1 -> 2 -> 3 -> 4 -> 5
+
+DEGRADED:
+state 5 -> 10
+
+MINIMAL:
+state 10 -> 20
+The backend still computed all intermediate states.
+
+29. Depth delivery flow
+The depth generator produces changes every ~50ms.
+
+Depth engine applies them immediately.
+
+Each client has its own depth delivery schedule.
+
+At flush:
+
+collect pending depth changes
+coalesce them
+serialize one DEPTH_DELTA
+Do not send the entire order book over WebSocket during normal operation.
+
+REST snapshot is the base.
+
+30. WebSocket client scheduling
+Each ClientState must have separate schedules:
+
+nextChartFlush
+nextDepthFlush
+nextTradeFlush
+Do not create three uncontrolled timers per client if a shared scheduler can be simpler.
+
+A single per-client scheduler loop is preferred:
+
+ticker/check
+    |
+    +-- chart due?
+    +-- depth due?
+    +-- trades due?
+    +-- heartbeat due?
+This reduces goroutine/timer proliferation.
+
+Use one serialized write path per WebSocket connection so concurrent goroutines never write to the same connection simultaneously.
+
+31. Tier override for demonstration
+Implement a debug control.
+
+The frontend should be able to send a WebSocket text command such as:
+
+{"type":"SET_TIER_OVERRIDE","tier":"FULL"}
+Allowed values:
+
+FULL
+DEGRADED
+MINIMAL
+AUTO
+When override is not AUTO:
+
+effective tier = override
+When set to AUTO:
+
+effective tier = hysteresis state-machine result
+Expose through a REST/debug endpoint if that fits the existing project, but keep the actual connection tier owned by the WebSocket ClientManager.
+
+Document that the override exists only for assignment demonstration/debugging.
+
+32. REST API list
+Implement at minimum:
+
+GET /api/health
+
+GET /api/candles?symbol=BTCUSDT&interval=1m&limit=200
+
+GET /api/candles?symbol=BTCUSDT&interval=5m&limit=200
+
+GET /api/orderbook/snapshot?symbol=BTCUSDT
+
+GET /api/trades?symbol=BTCUSDT&from=<timestamp>&to=<timestamp>&limit=200
+
+GET /api/ws/status
+Keep API response objects explicit and documented.
+
+33. WebSocket connection lifecycle
+On connection:
+
+1. Create ClientState
+2. Assign connection ID
+3. Register client
+4. Start heartbeat
+5. Start per-client delivery scheduler
+6. Wait for subscriptions/control
+Support symbol/interval subscription messages through a simple text control message, for example:
+
+{
+  "type": "SUBSCRIBE",
+  "symbol": "BTCUSDT",
+  "interval": "1m"
+}
+and:
+
+{
+  "type": "SUBSCRIBE",
+  "symbol": "BTCUSDT",
+  "interval": "5m"
+}
+Only one active chart interval is needed at a time because the assignment asks users to switch intervals.
+
+On disconnect:
+
+remove client
+stop heartbeat
+stop scheduler
+release resources
+34. Frontend synchronization contract
+The backend protocol must support:
+
+Candles
+REST history/base
+     +
+WebSocket CHART_DELTA
+If a REST request is in flight and chart deltas arrive:
+
+buffer them
+When REST returns:
+
+use the REST sequence as the new base
+replay valid buffered deltas
+discard stale ones
+If sequence continuity cannot be guaranteed:
+
+fetch fresh snapshot again
+Depth
+Same pattern:
+
+REST snapshot
+     +
+ordered WebSocket DEPTH_DELTA
+Detect missing/out-of-order state and resnapshot.
+
+35. Important sequence principle
+Do NOT create:
+
+FULL sequence
+DEGRADED sequence
+MINIMAL sequence
+There is one canonical sequence per data stream.
+
+For example:
+
+Chart:
+chartSeq
+
+Depth:
+depthSeq
+
+Trades:
+tradeId
+Tier only determines which canonical states are delivered and when.
+
+36. Cache / source-of-truth rules
+Use one authoritative in-memory market state.
+
+REST reads from that state/cache.
+
+WebSocket receives live updates from the market engine/hub rather than repeatedly polling REST/cache.
+
+Therefore:
+
+LIVE:
+Market Engine -> WebSocket
+
+HISTORY/SNAPSHOT:
+Cache -> REST
+Do not have WebSocket poll the REST cache on every delivery tick.
+
+37. Internal event bus
+Use simple Go channels/in-process fan-out.
+
+Example logical events:
+
+type TradeEvent struct {
+    Trade Trade
+}
+
+type ChartEvent struct {
+    Seq      uint32
+    Interval string
+    State    CandleState
+}
+
+type DepthEvent struct {
+    Seq     uint32
+    Changes []DepthChange
+}
+The WebSocket server subscribes to these internal streams.
+
+Do not use Kafka/Redis.
+
+38. Concurrency requirements
+Use mutexes or single-owner goroutines appropriately.
+
+Avoid races between:
+
+market generator
+candle engine
+order-book engine
+REST readers
+WebSocket publishers
+client state updates
+Run:
+
+go test -race ./...
+successfully.
+
+No data races.
+
+39. Tests
+Include meaningful automated tests, especially:
+
+Test 1 — Tier hysteresis
+Verify:
+
+good -> FULL
+one bad sample -> remains FULL
+three bad samples -> DEGRADED
+three more bad samples -> MINIMAL
+one good sample -> remains MINIMAL
+five good samples -> promotes
+Test 2 — Depth snapshot/delta synchronization
+Verify:
+
+snapshot seq 100
+delta 101
+delta 102
+delta 103
+produces correct book.
+
+Then simulate:
+
+100
+101
+103
+and verify:
+
+gap detected
+snapshot requested
+local book replaced
+Also test buffered deltas during the snapshot request.
+
+Additional useful tests
+candle OHLCV correctness
+
+chart delta reconstruction
+
+tier packet scheduler
+
+reconnect/re-subscribe
+
+malformed packet handling
+
+trade latest-10 behavior
+
+interval switch / stale REST response
+
+deterministic generator behavior
+
+40. Logging / observability
+Add lightweight structured logs for:
+
+client connected
+client disconnected
+
+client tier changed:
+FULL -> DEGRADED
+
+RTT
+SRTT
+RTTVAR
+effective latency
+
+chart packet sent
+depth packet sent
+trade packet sent
+
+snapshot recovery triggered
+sequence mismatch
+
+generator rates
+Do not spam the console on every market event by default.
+
+Provide debug logging through configuration.
+
+41. Configuration
+Use environment variables with sensible defaults:
+
+SERVER_PORT=8080
+WS_PATH=/ws
+
+SYMBOL=BTCUSDT
+RANDOM_SEED=42
+
+TRADE_INTERVAL_MS=50
+DEPTH_INTERVAL_MS=50
+
+FULL_DEPTH_MS=50
+FULL_CHART_MS=100
+FULL_TRADE_MS=250
+
+DEGRADED_DEPTH_MS=100
+DEGRADED_CHART_MS=250
+DEGRADED_TRADE_MS=500
+
+MINIMAL_DEPTH_MS=250
+MINIMAL_CHART_MS=1000
+MINIMAL_TRADE_MS=2000
+
+PING_INTERVAL_MS=1000
+Allow configuration without changing code.
+
+42. Error handling
+Gracefully handle:
+
+malformed WebSocket packet
+unknown message type
+invalid subscription
+invalid interval
+invalid REST parameters
+empty candle history
+closed WebSocket
+duplicate subscription
+duplicate/out-of-order depth update
+Never panic the entire backend because one client sends malformed data.
+
+43. Performance principles
+Do not over-engineer.
+
+The assignment needs:
+
+correctness
+predictability
+easy explanation
+Prefer:
+
+in-memory ring buffers
+channels
+simple structs
+fixed binary protocol
+one writer per WebSocket
+simple scheduler
+Avoid:
+
+Kafka
+Redis
+Postgres
+Kubernetes
+distributed tracing
+multiple backend services
+unless already present in the repository.
+
+44. README requirements
+Generate/update a README that explains:
+
+Architecture
+
+Trade generation
+
+Candle engine
+
+Order-book engine
+
+In-memory cache
+
+REST APIs
+
+WebSocket binary protocol
+
+Exact packet sizes:
+
+CHART_DELTA = 63 bytes
+
+DEPTH_DELTA = 95 bytes
+
+TRADE_UPDATE = 143 bytes
+
+PING = 15 bytes
+
+PONG = 15 bytes
+
+RTT calculation
+
+SRTT / RTTVAR
+
+Effective latency score
+
+Tier thresholds
+
+Hysteresis
+
+Packet rates per tier
+
+Sequence semantics
+
+Snapshot/delta recovery
+
+Reconnect behavior
+
+Debug tier override
+
+Local startup
+
+Deployment configuration
+
+Known limitations
+
+Explain clearly that:
+
+EffectiveLatency = SRTT + 4*RTTVAR
+is adapted from the TCP RTT estimator, while the 100ms/250ms tier boundaries and delivery rates are application-specific assignment choices.
+
+45. Implementation discipline
+Before writing code:
+
+Inspect the existing repository.
+
+Identify existing packages and entrypoints.
+
+Reuse existing dependencies where reasonable.
+
+Avoid rewriting unrelated code.
+
+Implement the market engine first.
+
+Add REST/state access.
+
+Add WebSocket protocol.
+
+Add client state/tier manager.
+
+Add adaptive scheduler.
+
+Add recovery and tests.
+
+Run go test -race ./....
+
+Run formatting/linting where available.
+
+Provide a concise implementation summary.

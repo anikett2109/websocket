@@ -1,0 +1,5 @@
+# HTTPS + WSS for the backend. The backend already gzips REST responses, so no
+# `encode` here; WebSocket upgrades are proxied automatically.
+{$DOMAIN} {
+	reverse_proxy backend:8080
+}

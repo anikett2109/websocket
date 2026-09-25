@@ -1,0 +1,84 @@
+## Build a Real-Time Cryptocurrency Trading Web App
+
+### Objective
+
+Build a polished web application for one simulated cryptocurrency market using React/Next.js. Create the backend that generates market data and serves it to the web app. The central challenge is to adapt the rate of live chart updates to each client's connection while keeping the underlying market data correct.
+
+## Requirements
+
+### 1. Synthetic market-data backend
+
+- Generate a continuous stream of trades for one symbol. Each trade should have a timestamp, price, quantity, and an unambiguous ordering identifier.
+- Maintain a plausible order book for that symbol with at least 10 bids and 10 asks. Provide a REST snapshot and incremental WebSocket updates that the web app can use to keep its local book synchronized.
+- Provide historical OHLCV candles for at least two selectable intervals, along with a WebSocket feed for the active candle and recent trades.
+- Make the generated feed repeatable enough to demonstrate and test important cases. No exchange account or external market-data service should be needed to run the project.
+- Document one command that starts the backend and how a browser connects to it locally and in a deployed environment.
+
+You may choose the backend language, framework, message format, and data-generation approach.
+
+### 2. Trading screen
+
+Build one responsive web screen showing:
+
+- The symbol's latest price and its movement.
+- A candlestick chart with at least two intervals. Fetch history from your backend, then update the active candle live. Let users hover, click, or drag to inspect a candle's timestamp and OHLC values.
+- The top 10 bids and asks from the locally maintained order book.
+- Recent trades and the current connection status.
+
+You may use a chart library **to render data supplied by your own application**. Fetching history, switching intervals, forming or updating candles, and handling late responses must be implemented in your code. Embedded charts, chart WebViews, and components that fetch or stream the data themselves are not allowed.
+
+### 3. Adaptive live chart delivery
+
+- The app must periodically measure round-trip time over its WebSocket connection and report both latency and jitter to the backend. Document how these measurements are calculated.
+- The backend must maintain a delivery tier **per client connection**: full, degraded, or minimal. It owns the tier decision. Define your own thresholds and target chart-update rates, and explain your choices.
+- Use hysteresis so brief fluctuations do not repeatedly switch tiers. Define what happens when reports are missing or the connection drops.
+- The backend must continue processing the complete generated trade stream and computing correct OHLCV candles at every tier. A slower tier changes how frequently chart updates are **delivered**, not the candle's final open, high, low, close, or volume.
+- Expose the active tier and effective update rate in the web app.
+- Provide a documented debug control that can force a connection into any tier so all three states can be demonstrated without relying on poor Wi-Fi. The normal automatic behavior must also work when the override is off.
+
+The target rates are a design choice, not a requirement to invent trades when no market event occurs. It is acceptable to combine multiple generated trades into one outgoing chart update if their candle values remain correct.
+
+### 4. Synchronization and recovery
+
+- Build the app's order book from a REST snapshot plus ordered WebSocket deltas. Handle updates that arrive while the snapshot request is in flight. Detect a missing or out-of-order update, then request a fresh snapshot and resume.
+- Reconnect and resubscribe after a disconnection. Show cached values as stale while disconnected rather than presenting them as live.
+- Handle browser tab visibility changes, interval changes, malformed messages, empty history, duplicate candles, and requests that finish after the selected interval has changed.
+- Keep scrolling, chart gestures, and other interactions smooth during frequent updates. Dispose of connections, timers, and subscriptions when appropriate.
+
+## Specifications
+
+- **Frontend:** React with Next.js and TypeScript is required. Use the App Router or Pages Router, and explain your choice. The result must be a responsive web app that works in a modern desktop browser.
+- **Backend:** Choose an appropriate backend language and framework. Node.js with TypeScript,  Go, Python, or another suitable option is accepted. The backend must expose REST and WebSocket interfaces and include clear setup instructions.
+- **Architecture:** Keep UI, application state, networking, and backend feed logic distinct. Choose and explain a suitable state-management approach.
+- **Precision:** Handle prices and quantities with appropriate numeric precision, and use timestamps and update identifiers consistently.
+- **Tests:** Include at least two meaningful automated tests. In particular, we recommend a test for tier changes and hysteresis, and a test for order-book snapshot/delta synchronization and recovery.
+
+## Deliverables
+
+1. Public GitHub Repo and Deployed URL
+2. A short screen recording showing the live chart, interval change, order book, a forced tier change, and recovery from a disconnected state.
+3. A README explaining:
+    - The frontend and backend architecture.
+    - State-management choices.
+    - Generated data and REST/WebSocket protocols.
+    - Chart and order-book synchronization.
+    - Latency and jitter measurement.
+    - Tier thresholds, hysteresis, and missing-report fallback.
+    - Reconnect, browser lifecycle, and stale-state behavior.
+    - Debug controls.
+    - Packages used.
+    - Local development and deployment instructions.
+    - Known limitations.
+
+## Evaluation Criteria
+
+- Correctness of the adaptive delivery state machine and per-client behavior.
+- Accuracy of candles across tiers and correct order-book recovery after missed updates.
+- UI quality, chart interactions, responsiveness, and clear live/stale states.
+- Sound WebSocket and REST integration, browser lifecycle handling, and error recovery.
+- Code structure, meaningful tests, and the ability to explain and modify the implementation in the interview.
+
+## Bonus Points
+
+- Watchlist reordering.
+- Production-style deployment with separate frontend and backend services, automated builds, and environment-based configuration.

@@ -1,0 +1,17 @@
+# Go
+backend/logs/
+logs/
+backend/server
+backend/*.exe
+# Node / Next
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+frontend/*.tsbuildinfo
+frontend/.env*.local
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
