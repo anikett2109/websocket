@@ -57,7 +57,7 @@ export class FeedClient {
     this.depth = new StreamSync<BookState, DepthDelta>("book", (s, d) => applyDepthDelta(s, d, this.tick), {
       requestSnapshot: (token) => this.fetchBook(token),
       sendSync: (seq) => this.send({ type: "SYNC", stream: "depth", seq }),
-      onState: (s) => this.queue({ book: { bids: s.bids, asks: s.asks, seq: s.seq, updatedAt: Date.now() } }),
+      onState: (s) => this.queue({ book: { bids: s.bids, asks: s.asks, seq: s.seq } }),
       onPhase: (phase) => this.queue({ book: { phase } }),
       onEvent: (m, l) => this.log(m, l),
     });
@@ -112,7 +112,7 @@ export class FeedClient {
   private connect() {
     if (this.disposed || this.paused) return;
     this.reconnectTimer = null;
-    this.queue({ conn: { status: this.attempt === 0 ? "connecting" : "reconnecting", reconnectAt: null, attempt: this.attempt } });
+    this.queue({ conn: { status: this.attempt === 0 ? "connecting" : "reconnecting", reconnectAt: null } });
     let ws: WebSocket;
     try {
       ws = new WebSocket(this.url);
@@ -125,7 +125,6 @@ export class FeedClient {
     this.ws = ws;
     ws.onmessage = (ev) => {
       if (this.ws !== ws) return; // message from a superseded socket
-      this.queue({ conn: { lastMessageAt: Date.now() } });
       if (typeof ev.data === "string") this.onText(ev.data);
       else this.onBinary(ev.data as ArrayBuffer);
     };
@@ -155,7 +154,7 @@ export class FeedClient {
     const base = Math.min(MAX_BACKOFF_MS, 500 * 2 ** this.attempt);
     const delay = Math.round(base * (0.7 + Math.random() * 0.6)); // jitter avoids thundering herds
     this.attempt++;
-    this.queue({ conn: { reconnectAt: Date.now() + delay, attempt: this.attempt } });
+    this.queue({ conn: { reconnectAt: Date.now() + delay } });
     this.reconnectTimer = setTimeout(() => this.connect(), delay);
   }
 
@@ -170,16 +169,22 @@ export class FeedClient {
   private onVisibility = () => {
     if (document.visibilityState === "visible") {
       // Samples taken while hidden measured timer throttling, not the network.
+      // Fresh window plus fast-start probes: the server re-runs its 3-report
+      // warmup after the silence, so the tier is restored in ~0.6 s.
       this.meter.reset();
-      this.log("tab visible: latency estimator reset", "info");
+      this.log("tab visible: latency estimator reset, fast-start probes", "info");
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ping();
+        for (const at of FAST_START_MS) this.retry(() => this.ping(), at);
+      }
       this.reconnectNow("tab visible");
       this.scheduleFlush();
     } else {
       // Deltas keep being applied while hidden (they are cheap); rendering pauses
       // because commits are frame-driven.
       // Probes are not reported while hidden, so the server's missing-report
-      // policy moves a background tab to MINIMAL (saving bandwidth); it is
-      // promoted again through normal hysteresis once visible.
+      // policy moves a background tab to MINIMAL (saving bandwidth); once
+      // visible, the server re-warms and classifies directly.
       this.log("tab hidden: rendering paused, sync continues, latency reports paused", "info");
     }
   };
@@ -273,8 +278,7 @@ export class FeedClient {
     if (typeof m.tickSize === "number" && m.tickSize > 0) this.tick = m.tickSize;
     this.log(`connected as ${m.connId}`, "info");
     this.queue({
-      conn: { status: "live", connId: String(m.connId), disconnectedAt: null, reconnectAt: null, attempt: 0 },
-      tier: { table: m.tiers as Record<TierName, Rates> },
+      conn: { status: "live", connId: String(m.connId), disconnectedAt: null, reconnectAt: null },
     });
     if (m.clock) useMarket.setState({ clock: m.clock as MarketState["clock"] });
     // Fast start: 3 probes 200 ms apart fill the server's warmup window (3
@@ -299,8 +303,6 @@ export class FeedClient {
         reason: String(m.reason ?? ""),
         rates: m.rates as Rates,
         serverEffectiveMs: Number(m.effectiveLatencyMs ?? 0),
-        latencyMs: Number(m.latencyMs ?? 0),
-        jitterMs: Number(m.jitterMs ?? 0),
         warmedUp: Boolean(m.warmedUp),
       },
     });
@@ -309,7 +311,7 @@ export class FeedClient {
   private onTrades(p: TradeUpdate) {
     if (p.newestId <= this.lastTradeId) return; // duplicate or stale
     this.lastTradeId = p.newestId;
-    this.queue({ trades: { list: p.trades, newestId: p.newestId, updatedAt: Date.now() } });
+    this.queue({ trades: { list: p.trades } });
     this.updateLtp(p.newestId, p.trades[0].price);
   }
 
@@ -319,7 +321,7 @@ export class FeedClient {
     const dir = this.ltp === null || price === this.ltp ? 0 : price > this.ltp ? 1 : -1;
     this.ltpSeq = seq;
     this.ltp = price;
-    this.queue({ ticker: dir === 0 ? { ltp: price, ltpSeq: seq } : { ltp: price, ltpSeq: seq, dir } });
+    this.queue({ ticker: dir === 0 ? { ltp: price } : { ltp: price, dir } });
   }
 
   // ---------------------------------------------------------------- latency
@@ -339,9 +341,9 @@ export class FeedClient {
     }
     if (document.hidden) return; // throttled timers would inflate RTT
     this.meter.add(rtt);
-    const { latency, jitter, score, samples } = this.meter;
+    const { latency, jitter, samples } = this.meter;
     this.send({ type: "NET_REPORT", latencyMs: latency, jitterMs: jitter, rttMs: rtt, simulatedMs: injected, samples });
-    this.queue({ net: { rttMs: rtt, latencyMs: latency, jitterMs: jitter, scoreMs: score, samples } });
+    this.queue({ net: { rttMs: rtt, latencyMs: latency, jitterMs: jitter, samples } });
   }
 
   private publishRates() {

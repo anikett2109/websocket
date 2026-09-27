@@ -52,9 +52,7 @@ type Client struct {
 	depthSynced bool
 	depthSeq    uint32
 	lastTradeID uint32
-	simLatency  time.Duration // server-side PONG delay (legacy debug action; the UI injects latency client-side)
 	simulated   time.Duration // latency the app reports it injected (debug), for logs/status
-	spikeNext   bool          // debug: delay the next PONG by SpikeDelay
 	tierSentAt  time.Time     // last TIER message (keepalive every tierKeepalive)
 	tierReason  string        // reason for the last tier change, repeated in keepalives
 	dropDepth   bool
@@ -160,19 +158,7 @@ func (c *Client) handleBinary(b []byte) {
 		c.sendError("malformed or unexpected binary packet")
 		return
 	}
-	pong := frame{data: protocol.EncodeProbe(protocol.TypePong, h.Seq, h.TS)}
-	c.mu.Lock()
-	delay := c.simLatency
-	if c.spikeNext {
-		delay += SpikeDelay
-		c.spikeNext = false
-	}
-	c.mu.Unlock()
-	if delay > 0 {
-		time.AfterFunc(delay, func() { c.enqueue(pong) })
-		return
-	}
-	c.enqueue(pong)
+	c.enqueue(frame{data: protocol.EncodeProbe(protocol.TypePong, h.Seq, h.TS)})
 }
 
 type controlMsg struct {
@@ -183,7 +169,6 @@ type controlMsg struct {
 	Seq       *uint32 `json:"seq"`
 	Tier      string  `json:"tier"`
 	Action    string  `json:"action"`
-	Ms        float64 `json:"ms"`
 	RTTMs     float64 `json:"rttMs"`
 	LatencyMs float64 `json:"latencyMs"`
 	JitterMs  float64 `json:"jitterMs"`
@@ -277,10 +262,6 @@ func (c *Client) sync(m controlMsg) {
 
 func validMs(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v < 60_000 }
 
-// SpikeDelay is the debug "Spike" action: one PONG delayed by 900 ms, a single
-// outlier the robust median must ignore (the tier should not change).
-const SpikeDelay = 900 * time.Millisecond
-
 // netReport is the health report: the browser's latency (median of its last
 // 5 RTTs) and jitter (their MAD). The server scores L = latency + 4*jitter.
 func (c *Client) netReport(m controlMsg) {
@@ -308,21 +289,12 @@ func (c *Client) debug(m controlMsg) {
 		c.dropDepth = true
 	case "DROP_CHART":
 		c.dropChart = true
-	case "SIM_LATENCY":
-		if !validMs(m.Ms) || m.Ms > 5000 {
-			c.mu.Unlock()
-			c.sendError("SIM_LATENCY ms must be 0..5000")
-			return
-		}
-		c.simLatency = time.Duration(m.Ms) * time.Millisecond
-	case "SPIKE":
-		c.spikeNext = true
 	default:
 		c.mu.Unlock()
-		c.sendError("unknown debug action " + m.Action)
+		c.sendError("unknown debug action " + m.Action + " (DROP_DEPTH or DROP_CHART)")
 		return
 	}
 	c.mu.Unlock()
-	slog.Info("debug control", "conn", c.id, "action", m.Action, "ms", m.Ms)
-	c.sendJSON(map[string]any{"type": "DEBUG_ACK", "action": strings.ToUpper(m.Action), "ms": m.Ms})
+	slog.Info("debug control", "conn", c.id, "action", m.Action)
+	c.sendJSON(map[string]any{"type": "DEBUG_ACK", "action": strings.ToUpper(m.Action)})
 }

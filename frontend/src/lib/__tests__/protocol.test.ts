@@ -98,7 +98,7 @@ describe("health report (latency = median5, jitter = MAD5)", () => {
     for (const r of [89, 90, 88, 118, 91]) m.add(r);
     expect(m.latency).toBe(90);
     expect(m.jitter).toBe(1);
-    expect(m.score).toBe(94);
+    expect(m.latency + 4 * m.jitter).toBe(94); // the server's score L
   });
   it("keeps only the last 5 probes", () => {
     const m = new HealthMeter();

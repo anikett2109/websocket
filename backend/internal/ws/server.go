@@ -77,8 +77,6 @@ func (s *Server) checkOrigin(r *http.Request) bool {
 	return origin == ""
 }
 
-func (s *Server) Rates(t client.Tier) config.TierRates { return s.hubs[t].rates }
-
 // Run starts the hubs and the missing-report watchdog.
 func (s *Server) Run(ctx context.Context) {
 	for _, h := range s.hubs {
@@ -143,7 +141,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 	c.sendJSON(map[string]any{
 		"type": "HELLO", "connId": c.id, "symbol": s.market.Symbol(),
 		"priceScale": model.PriceScale, "qtyScale": model.QtyScale, "tickSize": s.market.TickSize(),
-		"intervals": []string{"1m", "5m"}, "tiers": s.tierTable(),
+		"intervals": []string{"1m", "5m"},
 		"clock": map[string]any{
 			"epochMs": generator.Epoch, "tickMs": generator.TickMs, "cycleTicks": generator.CycleTicks,
 			"normalEnd": generator.NormalEnd, "burstEnd": generator.BurstEnd,
@@ -169,14 +167,6 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 	delete(s.clients, c.id)
 	s.mu.Unlock()
 	slog.Info("client disconnected", "conn", c.id, "duration", time.Since(c.since).Round(time.Second))
-}
-
-func (s *Server) tierTable() map[string]any {
-	out := map[string]any{}
-	for i, h := range s.hubs {
-		out[client.Tier(i).String()] = rateJSON(h.rates)
-	}
-	return out
 }
 
 func rateJSON(r config.TierRates) map[string]int64 {
@@ -215,7 +205,6 @@ func (s *Server) applyTier(c *Client, reason string, notify bool) {
 		return
 	}
 	c.tierSentAt = time.Now()
-	latency, jitter := c.machine.Stats()
 	override := "AUTO"
 	if c.override != nil {
 		override = c.override.String()
@@ -224,8 +213,6 @@ func (s *Server) applyTier(c *Client, reason string, notify bool) {
 		"type": "TIER", "tier": eff.String(), "autoTier": auto.String(), "override": override,
 		"changed": changed, "reason": c.tierReason,
 		"effectiveLatencyMs": float64(c.machine.Score().Microseconds()) / 1000, // L = median + 4·MAD
-		"latencyMs":          float64(latency.Microseconds()) / 1000,
-		"jitterMs":           float64(jitter.Microseconds()) / 1000,
 		"samples":            c.machine.Samples(), "warmedUp": c.machine.WarmedUp(),
 		"rates": rateJSON(s.hubs[eff].rates),
 	}

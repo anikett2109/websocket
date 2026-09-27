@@ -1,8 +1,8 @@
 // Fixed-point helpers. Market values stay integers (price x100, qty x1e6) end
 // to end; they are only turned into strings for display, never into floats for math.
 
-export const PRICE_SCALE = 100;
-export const QTY_SCALE = 1_000_000;
+const PRICE_SCALE = 100;
+const QTY_SCALE = 1_000_000;
 
 const group = (s: string) => s.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 

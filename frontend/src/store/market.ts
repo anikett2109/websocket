@@ -29,10 +29,8 @@ export interface MarketState {
   conn: {
     status: ConnStatus;
     connId: string | null;
-    lastMessageAt: number;
     disconnectedAt: number | null;
     reconnectAt: number | null;
-    attempt: number;
     paused: boolean;
   };
   tier: {
@@ -42,15 +40,12 @@ export interface MarketState {
     reason: string;
     rates: Rates | null;
     serverEffectiveMs: number; // L = latency + 4·jitter, as scored by the server
-    latencyMs: number; // reported latency the server used
-    jitterMs: number; // reported jitter the server used
     warmedUp: boolean;
-    table: Record<TierName, Rates> | null;
   };
-  net: { rttMs: number; latencyMs: number; jitterMs: number; scoreMs: number; samples: number };
+  net: { rttMs: number; latencyMs: number; jitterMs: number; samples: number };
   measured: { chart: number; depth: number; trades: number };
-  ticker: { ltp: number | null; ltpSeq: number; dir: 1 | -1 | 0; open24h: number | null; high24h: number | null; low24h: number | null; volume24h: number | null };
-  book: { bids: Level[]; asks: Level[]; seq: number; phase: Phase; updatedAt: number };
+  ticker: { ltp: number | null; dir: 1 | -1 | 0; open24h: number | null; high24h: number | null; low24h: number | null; volume24h: number | null };
+  book: { bids: Level[]; asks: Level[]; seq: number; phase: Phase };
   chart: {
     interval: string;
     closed: Candle[];
@@ -61,7 +56,7 @@ export interface MarketState {
     loading: boolean;
     error: string | null;
   };
-  trades: { list: Trade[]; newestId: number; updatedAt: number };
+  trades: { list: Trade[] };
   debug: { simLatencyMs: number };
   /** Market clock from HELLO: tick n = ⌊(t − epoch)/tickMs⌋, regime by n mod cycleTicks. */
   clock: { epochMs: number; tickMs: number; cycleTicks: number; normalEnd: number; burstEnd: number } | null;
@@ -69,15 +64,15 @@ export interface MarketState {
 }
 
 export const initialState: MarketState = {
-  conn: { status: "connecting", connId: null, lastMessageAt: 0, disconnectedAt: null, reconnectAt: null, attempt: 0, paused: false },
-  tier: { tier: null, autoTier: null, override: "AUTO", reason: "", rates: null, serverEffectiveMs: 0, latencyMs: 0, jitterMs: 0, warmedUp: false, table: null },
+  conn: { status: "connecting", connId: null, disconnectedAt: null, reconnectAt: null, paused: false },
+  tier: { tier: null, autoTier: null, override: "AUTO", reason: "", rates: null, serverEffectiveMs: 0, warmedUp: false },
   clock: null,
-  net: { rttMs: 0, latencyMs: 0, jitterMs: 0, scoreMs: 0, samples: 0 },
+  net: { rttMs: 0, latencyMs: 0, jitterMs: 0, samples: 0 },
   measured: { chart: 0, depth: 0, trades: 0 },
-  ticker: { ltp: null, ltpSeq: 0, dir: 0, open24h: null, high24h: null, low24h: null, volume24h: null },
-  book: { bids: [], asks: [], seq: 0, phase: "idle", updatedAt: 0 },
+  ticker: { ltp: null, dir: 0, open24h: null, high24h: null, low24h: null, volume24h: null },
+  book: { bids: [], asks: [], seq: 0, phase: "idle" },
   chart: { interval: "1m", closed: [], active: null, seq: 0, phase: "idle", resetToken: 0, loading: true, error: null },
-  trades: { list: [], newestId: 0, updatedAt: 0 },
+  trades: { list: [] },
   debug: { simLatencyMs: 0 },
   events: [],
 };

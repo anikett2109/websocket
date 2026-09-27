@@ -41,16 +41,6 @@ const (
 // from it at 20 ticks/s; trade ids (20.33/s) about as long.
 var Epoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
 
-type Regime uint8
-
-const (
-	Normal Regime = iota
-	Burst
-	Quiet
-)
-
-func (r Regime) String() string { return [...]string{"NORMAL", "BURST", "QUIET"}[r] }
-
 // TickAt returns the tick containing unix-ms time ms.
 func TickAt(ms int64) uint32 { return uint32((ms - Epoch) / TickMs) }
 
@@ -58,17 +48,6 @@ func TickAt(ms int64) uint32 { return uint32((ms - Epoch) / TickMs) }
 func TickTime(n uint32) int64 { return Epoch + int64(n)*TickMs }
 
 func phase(n uint32) uint32 { return n % CycleTicks }
-
-func RegimeOf(n uint32) Regime {
-	switch p := phase(n); {
-	case p < NormalEnd:
-		return Normal
-	case p < BurstEnd:
-		return Burst
-	default:
-		return Quiet
-	}
-}
 
 // TradesAt is the number of trades generated in tick n.
 func TradesAt(n uint32) int {

@@ -11,7 +11,7 @@
 // without moving them. The backend owns the tier and scores
 //   L = latency + 4 * jitter.
 
-export const WINDOW = 5;
+const WINDOW = 5;
 
 const median = (xs: number[]) => {
   const s = [...xs].sort((a, b) => a - b);
@@ -39,11 +39,6 @@ export class HealthMeter {
   get jitter() {
     const l = this.latency;
     return this.window.length ? median(this.window.map((x) => Math.abs(x - l))) : 0;
-  }
-
-  /** The score the backend computes from this report. */
-  get score() {
-    return this.latency + 4 * this.jitter;
   }
 
   reset() {

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -200,11 +201,14 @@ func TestMissingReports(t *testing.T) {
 	if r := d.m.CheckTimeout(d.now.Add(6 * time.Second)); r == "" || d.m.Tier() != Minimal {
 		t.Fatalf("6 s of silence should demote to MINIMAL, got %v", d.m.Tier())
 	}
+	// Reports resume (tab visible again): silence was not evidence of a bad
+	// network, so after a fresh 3-report warmup the tier is classified directly.
 	d.now = d.now.Add(7 * time.Second)
-	d.healthy(4)
-	d.want(Minimal, "4 good reports must not promote yet")
+	d.window = nil // the browser resets its window when the tab becomes visible
+	d.healthy(2)
+	d.want(Minimal, "still warming up after silence")
 	d.healthy(1)
-	d.want(Degraded, "5th good report promotes one step")
+	d.want(Full, "3rd report after silence classifies directly (not +5 per step)")
 }
 
 func TestThresholdsDerivedFromChartIntervals(t *testing.T) {
@@ -216,4 +220,26 @@ func TestThresholdsDerivedFromChartIntervals(t *testing.T) {
 			t.Errorf("Classify(%v)=%v want %v", l, got, want)
 		}
 	}
+}
+
+// Summarize is the client's health-report math (mirrors the browser's
+// HealthMeter): latency = median, jitter = MAD, score L = latency + 4*jitter.
+func Summarize(samples []time.Duration) (l, median, mad time.Duration) {
+	median = medianOf(samples)
+	dev := make([]time.Duration, len(samples))
+	for i, s := range samples {
+		dev[i] = (s - median).Abs()
+	}
+	mad = medianOf(dev)
+	return median + 4*mad, median, mad
+}
+
+func medianOf(xs []time.Duration) time.Duration {
+	s := slices.Clone(xs)
+	slices.Sort(s)
+	n := len(s)
+	if n%2 == 1 {
+		return s[n/2]
+	}
+	return (s[n/2-1] + s[n/2]) / 2
 }

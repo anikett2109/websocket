@@ -33,7 +33,6 @@ package client
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 )
@@ -86,28 +85,6 @@ func Classify(l time.Duration) Tier {
 	}
 }
 
-// Summarize is the client's health-report math (mirrors the browser's
-// HealthMeter): latency = median, jitter = MAD, score L = latency + 4*jitter.
-func Summarize(samples []time.Duration) (l, median, mad time.Duration) {
-	median = medianOf(samples)
-	dev := make([]time.Duration, len(samples))
-	for i, s := range samples {
-		dev[i] = (s - median).Abs()
-	}
-	mad = medianOf(dev)
-	return median + 4*mad, median, mad
-}
-
-func medianOf(xs []time.Duration) time.Duration {
-	s := slices.Clone(xs)
-	slices.Sort(s)
-	n := len(s)
-	if n%2 == 1 {
-		return s[n/2]
-	}
-	return (s[n/2-1] + s[n/2]) / 2
-}
-
 type MachineConfig struct {
 	WarmupSamples      int           // samples before the first classification (3)
 	ReportDegradeAfter time.Duration // no report for this long => at most DEGRADED (3 s = 3 missed probes)
@@ -126,6 +103,11 @@ type Machine struct {
 	score      time.Duration
 	latency    time.Duration
 	jitter     time.Duration
+	// silenced: the current tier came from missing reports (e.g. a hidden
+	// tab), not from measured latency. Silence is absence of evidence, so when
+	// reports resume the machine re-runs warmup and classifies directly
+	// instead of climbing back through the slow promotion hysteresis.
+	silenced bool
 }
 
 // NewMachine starts in DEGRADED: until warmup completes the link is unknown,
@@ -140,12 +122,15 @@ func (m *Machine) Stats() (latency, jitter time.Duration) { return m.latency, m.
 func (m *Machine) Samples() int                           { return m.samples }
 func (m *Machine) LastReport() time.Time                  { return m.lastReport }
 func (m *Machine) WarmedUp() bool                         { return m.samples >= m.cfg.WarmupSamples }
-func (m *Machine) Counters() (demote, promote int)        { return m.demote, m.promote }
 
 // Report feeds one health report (the client's latency and jitter). It
 // returns a non-empty reason when the tier changed.
 func (m *Machine) Report(latency, jitter time.Duration, now time.Time) string {
 	m.lastReport = now
+	if m.silenced {
+		m.silenced = false
+		m.samples = 0 // fresh warmup: 3 reports, then a direct classification
+	}
 	m.samples++
 	l := latency + 4*jitter
 	m.score, m.latency, m.jitter = l, latency, jitter
@@ -205,6 +190,9 @@ func (m *Machine) Report(latency, jitter time.Duration, now time.Time) string {
 // Normal reports promote it back with hysteresis.
 func (m *Machine) CheckTimeout(now time.Time) string {
 	silent := now.Sub(m.lastReport)
+	if silent >= m.cfg.ReportDegradeAfter {
+		m.silenced = true
+	}
 	switch {
 	case silent >= m.cfg.ReportMinimalAfter && m.tier != Minimal:
 		return m.set(Minimal, fmt.Sprintf("no latency report for %v", silent.Round(time.Second)))

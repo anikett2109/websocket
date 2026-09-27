@@ -155,3 +155,26 @@ func TestAggregate(t *testing.T) {
 		t.Fatal("aggregation lost volume or close seq")
 	}
 }
+
+// Regime classification of a tick (test helper; production code works on the
+// per-tick trade and book counts directly).
+type Regime uint8
+
+const (
+	Normal Regime = iota
+	Burst
+	Quiet
+)
+
+func (r Regime) String() string { return [...]string{"NORMAL", "BURST", "QUIET"}[r] }
+
+func RegimeOf(n uint32) Regime {
+	switch p := phase(n); {
+	case p < NormalEnd:
+		return Normal
+	case p < BurstEnd:
+		return Burst
+	default:
+		return Quiet
+	}
+}

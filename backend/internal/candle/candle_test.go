@@ -1,6 +1,7 @@
 package candle
 
 import (
+	"errors"
 	"math/rand"
 	"testing"
 
@@ -107,4 +108,38 @@ func TestEvictedBase(t *testing.T) {
 
 func sameOHLCV(a, b model.Candle) bool {
 	return a.Start == b.Start && a.Open == b.Open && a.High == b.High && a.Low == b.Low && a.Close == b.Close && a.Volume == b.Volume
+}
+
+// ErrSeqMismatch means a transition's base does not match the local sequence.
+var ErrSeqMismatch = errors.New("candle: base sequence mismatch")
+
+// Local is a reference client-side chart reconstruction, mirroring the web app.
+// It is used by tests to prove coalesced delivery reproduces canonical candles.
+type Local struct {
+	Seq    uint32
+	Active model.Candle
+	Closed []model.Candle
+}
+
+func (l *Local) Apply(t Transition) error {
+	if t.BaseSeq != l.Seq {
+		return ErrSeqMismatch
+	}
+	switch {
+	case t.Start == l.Active.Start:
+		l.Active.Open += t.Delta[0]
+		l.Active.High += t.Delta[1]
+		l.Active.Low += t.Delta[2]
+		l.Active.Close += t.Delta[3]
+		l.Active.Volume += t.Delta[4]
+	case t.Start > l.Active.Start:
+		if l.Active.Start != 0 {
+			l.Closed = append(l.Closed, l.Active)
+		}
+		l.Active = model.Candle{Start: t.Start, Open: t.Delta[0], High: t.Delta[1], Low: t.Delta[2], Close: t.Delta[3], Volume: t.Delta[4]}
+	default:
+		return ErrSeqMismatch
+	}
+	l.Seq = t.Seq
+	return nil
 }

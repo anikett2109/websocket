@@ -53,7 +53,7 @@ export interface TradeUpdate {
   trades: Trade[]; // newest first
 }
 
-export interface Pong {
+interface Pong {
   kind: "pong";
   seq: number;
   ts: number;

@@ -154,7 +154,7 @@ export function DebugPanel() {
               {(
                 [
                   [0, "off"],
-                  [250, "+250 ms → DEGRADED"],
+                  [300, "+300 ms → DEGRADED"],
                   [700, "+700 ms → MINIMAL"],
                 ] as const
               ).map(([ms, label]) => (
