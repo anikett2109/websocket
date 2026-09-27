@@ -22,9 +22,14 @@ import (
 	"cryptofeed/internal/candle"
 	"cryptofeed/internal/client"
 	"cryptofeed/internal/config"
+	"cryptofeed/internal/generator"
 	"cryptofeed/internal/model"
 	"cryptofeed/internal/orderbook"
 )
+
+// tierKeepalive refreshes the TIER status (latency score, rates) for the UI
+// between changes.
+const tierKeepalive = 5 * time.Second
 
 // Market is the read-only view of canonical state the delivery layer needs.
 type Market interface {
@@ -36,6 +41,7 @@ type Market interface {
 	HasChartState(interval string, seq uint32) bool
 	ChartTransitions(interval string, base uint32) ([]candle.Transition, error)
 	LatestTrades(n int) []model.Trade
+	Subscribe() <-chan uint32
 }
 
 type Server struct {
@@ -76,7 +82,7 @@ func (s *Server) Rates(t client.Tier) config.TierRates { return s.hubs[t].rates 
 // Run starts the hubs and the missing-report watchdog.
 func (s *Server) Run(ctx context.Context) {
 	for _, h := range s.hubs {
-		go h.run(ctx)
+		go h.run(ctx, s.market.Subscribe())
 	}
 	t := time.NewTicker(250 * time.Millisecond)
 	defer t.Stop()
@@ -93,8 +99,9 @@ func (s *Server) Run(ctx context.Context) {
 			for _, c := range s.snapshotClients() {
 				c.mu.Lock()
 				reason := c.machine.CheckTimeout(now)
+				keepalive := now.Sub(c.tierSentAt) >= tierKeepalive
 				c.mu.Unlock()
-				if reason != "" {
+				if reason != "" || keepalive {
 					s.applyTier(c, reason, true)
 				}
 			}
@@ -137,6 +144,10 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		"type": "HELLO", "connId": c.id, "symbol": s.market.Symbol(),
 		"priceScale": model.PriceScale, "qtyScale": model.QtyScale, "tickSize": s.market.TickSize(),
 		"intervals": []string{"1m", "5m"}, "tiers": s.tierTable(),
+		"clock": map[string]any{
+			"epochMs": generator.Epoch, "tickMs": generator.TickMs, "cycleTicks": generator.CycleTicks,
+			"normalEnd": generator.NormalEnd, "burstEnd": generator.BurstEnd,
+		},
 	})
 	s.applyTier(c, "connected (warming up)", true)
 	s.mu.Lock()
@@ -195,17 +206,26 @@ func (s *Server) applyTier(c *Client, reason string, notify bool) {
 		c.hub = s.hubs[eff]
 		c.hub.add(c)
 	}
-	if !notify {
+	if reason != "" {
+		c.tierReason = reason
+	}
+	// TIER goes out on a change (or explicit notify: connect, override,
+	// keepalive), not on every report: it is ~230 B, a quarter of MINIMAL's budget.
+	if !notify && !changed && reason == "" {
 		return
 	}
+	c.tierSentAt = time.Now()
+	median, mad := c.machine.Stats()
 	override := "AUTO"
 	if c.override != nil {
 		override = c.override.String()
 	}
 	msg := map[string]any{
 		"type": "TIER", "tier": eff.String(), "autoTier": auto.String(), "override": override,
-		"changed": changed, "reason": reason,
-		"effectiveLatencyMs": float64(c.machine.Score().Microseconds()) / 1000,
+		"changed": changed, "reason": c.tierReason,
+		"effectiveLatencyMs": float64(c.machine.Score().Microseconds()) / 1000, // L = median + 4·MAD
+		"medianMs":           float64(median.Microseconds()) / 1000,
+		"madMs":              float64(mad.Microseconds()) / 1000,
 		"srttMs":             float64(c.srtt.Microseconds()) / 1000,
 		"rttvarMs":           float64(c.rttvar.Microseconds()) / 1000,
 		"samples":            c.machine.Samples(), "warmedUp": c.machine.WarmedUp(),
@@ -284,7 +304,7 @@ func (s *Server) Status() []ClientStatus {
 			LastReportAgoMs:    time.Since(c.machine.LastReport()).Milliseconds(),
 			Interval:           c.interval, ChartSeq: c.chartSeq, DepthSeq: c.depthSeq,
 			Rates: rateJSON(s.hubs[c.tier].rates),
-			Sent:  map[string]uint64{"depth": c.stats.depth, "chart": c.stats.chart, "trade": c.stats.trade},
+			Sent:  map[string]uint64{"depth": c.stats.depth, "chart": c.stats.chart, "trade": c.stats.trade, "frames": c.stats.frames, "bytes": c.stats.bytes},
 		}
 		c.mu.Unlock()
 		out = append(out, st)

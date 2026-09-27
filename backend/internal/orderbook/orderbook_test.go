@@ -8,29 +8,35 @@ import (
 
 const tick = 50
 
-func newGen() *generator.Generator {
-	return generator.New(generator.Config{Seed: 42, StartPrice: 6_500_000, TickSize: tick, DepthSkipPct: 0})
+var mkt = generator.Model{Base: 6_500_000, Tick: tick}
+
+// n0 is the start of a regime cycle; its first 800 ticks change the book every tick.
+const n0 = uint32(1200 * 400_000)
+
+// feed applies every book change in ticks [from, to) to e.
+func feed(t *testing.T, e *Engine, from, to uint32) {
+	t.Helper()
+	for n := from; n < to; n++ {
+		if ev := mkt.Event(n); ev.Book != nil {
+			if err := e.Apply(*ev.Book); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 }
 
-// TestSnapshotThenDeltas: snapshot at seq N, then deltas N->N+1->N+2->N+3
+// TestSnapshotThenDeltas: snapshot at seq S, then deltas S->S+1->S+2->S+3
 // reproduce the canonical book exactly.
 func TestSnapshotThenDeltas(t *testing.T) {
-	g := newGen()
 	e := NewEngine(tick, 256)
-	for i := 0; i < 100; i++ {
-		if err := e.Apply(*g.Step(int64(i)).Book); err != nil {
-			t.Fatal(err)
-		}
-	}
-	local := e.Book() // REST snapshot, seq 100
-	if local.Seq != 100 {
+	feed(t, e, n0, n0+101)
+	local := e.Book() // REST snapshot
+	if local.Seq != n0+100 {
 		t.Fatalf("seq=%d", local.Seq)
 	}
-	for i := 0; i < 3; i++ {
+	for n := n0 + 101; n <= n0+103; n++ {
 		base := e.Book()
-		if err := e.Apply(*g.Step(int64(100 + i)).Book); err != nil {
-			t.Fatal(err)
-		}
+		feed(t, e, n, n+1)
 		d, err := Diff(base, e.Book())
 		if err != nil {
 			t.Fatal(err)
@@ -44,21 +50,19 @@ func TestSnapshotThenDeltas(t *testing.T) {
 	}
 }
 
-// TestCoalescedDepthDeltas: a slow tier sends one delta spanning many canonical
-// updates, including price-level shifts; the result must still be exact.
+// TestCoalescedDepthDeltas: a slower tier sends one delta spanning several
+// canonical states, including price-level shifts and the sparse quiet regime;
+// the result must still be exact. every = tier depth interval in ticks.
 func TestCoalescedDepthDeltas(t *testing.T) {
-	for _, every := range []int{1, 3, 5, 17} {
-		g := newGen()
-		e := NewEngine(tick, 256)
-		_ = e.Apply(g.Book())
+	for _, every := range []uint32{1, 3, 10} { // FULL, DEGRADED, MINIMAL
+		e := NewEngine(tick, 4096)
+		feed(t, e, n0, n0+1)
 		local := e.Book()
 		shifts := 0
-		for i := 1; i <= 2000; i++ {
-			if err := e.Apply(*g.Step(int64(i)).Book); err != nil {
-				t.Fatal(err)
-			}
-			if i%every != 0 {
-				continue
+		for n := n0 + 1; n < n0+2*generator.CycleTicks; n++ {
+			feed(t, e, n, n+1)
+			if n%every != 0 || e.Book().Seq == local.Seq {
+				continue // not due, or nothing changed: nothing is sent
 			}
 			base, ok := e.StateAt(local.Seq)
 			if !ok {
@@ -75,7 +79,7 @@ func TestCoalescedDepthDeltas(t *testing.T) {
 				t.Fatal(err)
 			}
 			if local != e.Book() {
-				t.Fatalf("every=%d i=%d diverged", every, i)
+				t.Fatalf("every=%d tick=%d diverged", every, n)
 			}
 		}
 		if shifts == 0 {
@@ -84,43 +88,46 @@ func TestCoalescedDepthDeltas(t *testing.T) {
 	}
 }
 
-// TestGapDetected: 100, 101, 103 -> the 103 delta's base (102) does not match
-// the local seq (101) and must be rejected so the client re-snapshots.
+// TestGapDetected: S, S+1, S+3 -> the S+3 delta's base (S+2) does not match the
+// local seq (S+1) and must be rejected so the client re-snapshots.
 func TestGapDetected(t *testing.T) {
-	g := newGen()
 	e := NewEngine(tick, 256)
-	for i := 0; i < 100; i++ {
-		_ = e.Apply(*g.Step(int64(i)).Book)
-	}
+	feed(t, e, n0, n0+100)
 	local := e.Book()
 	var deltas []Delta
-	for i := 0; i < 3; i++ {
+	for n := n0 + 100; n < n0+103; n++ {
 		base := e.Book()
-		_ = e.Apply(*g.Step(int64(100 + i)).Book)
+		feed(t, e, n, n+1)
 		d, _ := Diff(base, e.Book())
 		deltas = append(deltas, d)
 	}
-	local, err := ApplyDelta(local, deltas[0], tick) // 100 -> 101
+	local, err := ApplyDelta(local, deltas[0], tick)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyDelta(local, deltas[2], tick); err != ErrSeqMismatch { // 102 -> 103
+	if _, err := ApplyDelta(local, deltas[2], tick); err != ErrSeqMismatch {
 		t.Fatalf("want ErrSeqMismatch on gap, got %v", err)
 	}
-	// Recovery: fresh snapshot replaces the local book.
-	local = e.Book()
-	if local.Seq != 103 {
+	if local = e.Book(); local.Seq != n0+102 { // recovery: fresh snapshot
 		t.Fatalf("snapshot seq=%d", local.Seq)
 	}
 }
 
+func TestApplyRejectsOldSeq(t *testing.T) {
+	e := NewEngine(tick, 16)
+	feed(t, e, n0, n0+5)
+	if err := e.Apply(mkt.Book(n0 + 2)); err == nil {
+		t.Fatal("out-of-order book accepted")
+	}
+}
+
 func TestValidateRejectsCrossedBook(t *testing.T) {
-	b := newGen().Book()
+	b := mkt.Book(n0)
 	b.Asks[0].Price = b.Bids[0].Price
 	if Validate(b, tick) == nil {
 		t.Fatal("crossed book accepted")
 	}
-	b = newGen().Book()
+	b = mkt.Book(n0)
 	b.Bids[3].Qty = 0
 	if Validate(b, tick) == nil {
 		t.Fatal("empty level accepted")

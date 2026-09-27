@@ -13,12 +13,31 @@ import (
 
 	"cryptofeed/internal/config"
 	"cryptofeed/internal/generator"
-	"cryptofeed/internal/history"
 	"cryptofeed/internal/market"
 	"cryptofeed/internal/model"
 	"cryptofeed/internal/orderbook"
 	"cryptofeed/internal/protocol"
 )
+
+var mdl = generator.Model{Base: 6_500_000, Tick: 50}
+
+// seededMarket builds a market whose live processing starts at tick n0,
+// 100 ticks into a normal regime (1 trade and 1 book change per tick).
+func seededMarket(t *testing.T) (*market.Market, uint32) {
+	t.Helper()
+	now := generator.TickAt(time.Now().UnixMilli())
+	n0 := now - now%generator.CycleTicks + 100
+	mkt := market.New(market.Config{Symbol: "BTCUSDT", BasePrice: 6_500_000, TickSize: 50, HistoryCandles: 500, TradeBuffer: 1000, StateRing: 1024})
+	var recent []model.Trade
+	for n := n0 - 200; n < n0; n++ {
+		recent = append(recent, mdl.Trades(n)...)
+	}
+	past := mdl.Candles(n0-2*generator.CycleTicks, n0, 60_000)
+	if err := mkt.Seed(past, generator.TickTime(n0), generator.LastTradeTick(n0-1), recent, mdl.Book(n0-1)); err != nil {
+		t.Fatal(err)
+	}
+	return mkt, n0
+}
 
 type harness struct {
 	t    *testing.T
@@ -29,31 +48,24 @@ type harness struct {
 func setup(t *testing.T) *harness {
 	t.Helper()
 	cfg := config.Load()
-	fast := config.TierRates{Depth: 10 * time.Millisecond, Chart: 20 * time.Millisecond, Trade: 30 * time.Millisecond}
+	fast := config.TierRates{Depth: 50 * time.Millisecond, Chart: 50 * time.Millisecond, Trade: 50 * time.Millisecond}
 	cfg.Full, cfg.Degraded, cfg.Minimal = fast, fast, fast
-	cfg.Minimal.Depth = 40 * time.Millisecond
 
-	gen := generator.New(generator.Config{Seed: 1, StartPrice: 6_500_000, TickSize: 50, DepthSkipPct: 0})
-	mkt := market.New(market.Config{Symbol: "BTCUSDT", StartPrice: 6_500_000, TickSize: 50, HistoryCandles: 50, TradeBuffer: 1000, StateRing: 1024})
-	now := time.Now().UnixMilli()
-	past := history.Rebase(history.Generate("BTCUSDT", 1, 1, now, 6_500_000, 50).ToCandles(), now)
-	if err := mkt.Seed(past, now, gen.Book()); err != nil {
-		t.Fatal(err)
-	}
+	mkt, n0 := seededMarket(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
 	srv := NewServer(cfg, mkt)
 	go srv.Run(ctx)
-	go func() { // drive the market like the real generator, at 5ms
+	go func() { // drive the market 10x faster than real time: one tick per 5 ms
 		tk := time.NewTicker(5 * time.Millisecond)
 		defer tk.Stop()
-		for {
+		for n := n0; ; n++ {
 			select {
 			case <-ctx.Done():
 				return
-			case now := <-tk.C:
-				mkt.Process(gen.Step(now.UnixMilli()))
+			case <-tk.C:
+				mkt.Process(mdl.Event(n))
 			}
 		}
 	}()
@@ -81,6 +93,30 @@ func (h *harness) next() (bin []byte, txt map[string]any) {
 	}
 	_ = json.Unmarshal(data, &txt)
 	return nil, txt
+}
+
+// nextDepth returns the next DEPTH_DELTA packet, looking inside batched frames.
+func (h *harness) nextDepth() orderbook.Delta {
+	h.t.Helper()
+	for {
+		b, _ := h.next()
+		if b == nil {
+			continue
+		}
+		parts, err := protocol.SplitFrame(b)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		for _, p := range parts {
+			if p[0] == protocol.TypeDepthDelta {
+				d, err := protocol.DecodeDepthDelta(p)
+				if err != nil {
+					h.t.Fatal(err)
+				}
+				return d
+			}
+		}
+	}
 }
 
 func (h *harness) waitText(typ string) map[string]any {
@@ -115,34 +151,22 @@ func TestDepthSyncGapAndRecovery(t *testing.T) {
 	h.waitText("HELLO")
 	local := h.syncDepth()
 
-	applied := 0
-	for applied < 20 {
-		b, _ := h.next()
-		if b == nil || b[0] != protocol.TypeDepthDelta {
-			continue
-		}
-		d, err := protocol.DecodeDepthDelta(b)
-		if err != nil {
-			t.Fatal(err)
-		}
+	for applied := 0; applied < 20; applied++ {
+		d := h.nextDepth()
+		var err error
 		if local, err = orderbook.ApplyDelta(local, d, 50); err != nil {
 			t.Fatalf("delta %d->%d on local %d: %v", d.BaseSeq, d.Seq, local.Seq, err)
 		}
-		if canon, ok := stateAt(h.mkt, local.Seq); ok && canon != local {
-			t.Fatalf("local book diverged at seq %d", local.Seq)
+		if canon := mdl.Book(local.Seq); canon != local {
+			t.Fatalf("local book diverged from the market function at tick %d", local.Seq)
 		}
-		applied++
 	}
 
 	// Inject a gap: the server advances its view of this client without sending.
 	h.send(map[string]any{"type": "DEBUG", "action": "DROP_DEPTH"})
 	gap := false
 	for !gap {
-		b, _ := h.next()
-		if b == nil || b[0] != protocol.TypeDepthDelta {
-			continue
-		}
-		d, _ := protocol.DecodeDepthDelta(b)
+		d := h.nextDepth()
 		if _, err := orderbook.ApplyDelta(local, d, 50); err == orderbook.ErrSeqMismatch {
 			gap = true
 		} else if err == nil {
@@ -152,17 +176,11 @@ func TestDepthSyncGapAndRecovery(t *testing.T) {
 
 	// Recovery: fresh snapshot + SYNC, then deltas apply cleanly again.
 	local = h.syncDepth()
-	for applied = 0; applied < 5; {
-		b, _ := h.next()
-		if b == nil || b[0] != protocol.TypeDepthDelta {
-			continue
-		}
-		d, _ := protocol.DecodeDepthDelta(b)
+	for applied := 0; applied < 5; applied++ {
 		var err error
-		if local, err = orderbook.ApplyDelta(local, d, 50); err != nil {
+		if local, err = orderbook.ApplyDelta(local, h.nextDepth(), 50); err != nil {
 			t.Fatalf("after recovery: %v", err)
 		}
-		applied++
 	}
 }
 
@@ -209,17 +227,54 @@ func TestMalformedInputDoesNotKillConnection(t *testing.T) {
 	}
 }
 
-func stateAt(m *market.Market, seq uint32) (model.Book, bool) {
-	// Compare against the live book only when it has not moved on since.
-	cur := m.BookSnapshot().Book
-	if cur.Seq != seq {
-		return model.Book{}, false // moved on; skip the equality check
-	}
-	return cur, true
-}
-
 func httpHandler(s *Server) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.Handle)
 	return mux
+}
+
+// TestHubBatchesAndCoalescesByTick pins down the sequence model: one unified
+// clock (the market tick). A DEGRADED client flushed every 6 ticks receives
+// chart base n -> n+6 and depth base n -> n+6 (depth fires every 3 ticks but
+// both are due on tick 6), plus the latest trades, all in ONE frame.
+func TestHubBatchesAndCoalescesByTick(t *testing.T) {
+	mkt, n0 := seededMarket(t)
+	base := generator.LastTradeTick(n0 - 1) // = n0-1 in the normal regime
+	c := &Client{id: "t", send: make(chan frame, 8), closed: make(chan struct{}),
+		interval: "1m", chartSynced: true, chartSeq: base, depthSynced: true, depthSeq: mkt.DepthSeq()}
+	h := newHub(0, config.TierRates{Depth: 150 * time.Millisecond, Chart: 300 * time.Millisecond, Trade: 500 * time.Millisecond}, mkt)
+	h.add(c)
+	if h.every != [3]uint64{3, 6, 10} {
+		t.Fatalf("intervals in ticks = %v, want [3 6 10]", h.every)
+	}
+
+	for n := n0; n < n0+6; n++ {
+		mkt.Process(mdl.Event(n))
+	}
+	h.flush(true, true, true)
+	f := <-c.send
+	parts, err := protocol.SplitFrame(f.data)
+	if err != nil || len(parts) != 3 {
+		t.Fatalf("want depth+chart+trades in one frame, got %d packets (err %v)", len(parts), err)
+	}
+	d, _ := protocol.DecodeDepthDelta(parts[0])
+	ch, _ := protocol.DecodeChartDelta(parts[1])
+	tr, _ := protocol.DecodeTradeUpdate(parts[2])
+	if d.BaseSeq != n0-1 || d.Seq != n0+5 {
+		t.Fatalf("depth %d->%d, want %d->%d", d.BaseSeq, d.Seq, n0-1, n0+5)
+	}
+	if ch.BaseSeq != base || ch.Seq != n0+5 {
+		t.Fatalf("chart %d->%d, want %d->%d (6 ticks = 6 trades coalesced)", ch.BaseSeq, ch.Seq, base, n0+5)
+	}
+	if tr[0].ID != generator.TradesBefore(n0+6) {
+		t.Fatalf("newest trade id %d, want %d", tr[0].ID, generator.TradesBefore(n0+6))
+	}
+
+	// Nothing changed since: nothing is sent (no manufactured updates).
+	h.flush(true, true, true)
+	select {
+	case f := <-c.send:
+		t.Fatalf("unexpected frame of %d bytes with no market change", len(f.data))
+	default:
+	}
 }

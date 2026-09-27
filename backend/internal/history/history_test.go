@@ -4,23 +4,23 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+
+	"cryptofeed/internal/generator"
 )
 
-const tick = 50
+var mdl = generator.Model{Base: 6_500_000, Tick: 50}
+
+// A time well after the generator epoch, mid-minute.
+var now = generator.Epoch + 250*24*3600*1000 + 37_250
 
 func TestGenerateSaveLoadRoundTrip(t *testing.T) {
-	now := int64(1_790_000_000_000)
-	f := Generate("BTCUSDT", 42, 3, now, 6_500_000, tick)
-	if len(f.Candles) != 3*24*60 {
-		t.Fatalf("candles=%d want %d", len(f.Candles), 3*24*60)
+	f := Generate("BTCUSDT", mdl, 1, now)
+	if len(f.Candles) != 24*60 {
+		t.Fatalf("candles=%d want %d", len(f.Candles), 24*60)
 	}
-	if last := f.Candles[len(f.Candles)-1]; last[4] != 6_500_000 {
-		t.Fatalf("last close %d want 6500000", last[4])
-	}
-	if err := Validate(f, "BTCUSDT", tick); err != nil {
+	if err := Validate(f, "BTCUSDT", mdl); err != nil {
 		t.Fatal(err)
 	}
-
 	path := filepath.Join(t.TempDir(), "h.json")
 	if err := Save(path, f); err != nil {
 		t.Fatal(err)
@@ -29,7 +29,7 @@ func TestGenerateSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Seed != f.Seed || got.Symbol != f.Symbol || len(got.Candles) != len(f.Candles) {
+	if got.Generator != Generator || got.BasePrice != f.BasePrice || len(got.Candles) != len(f.Candles) {
 		t.Fatalf("header mismatch: %+v", got)
 	}
 	for i := range f.Candles {
@@ -37,46 +37,48 @@ func TestGenerateSaveLoadRoundTrip(t *testing.T) {
 			t.Fatalf("candle %d: %v != %v", i, got.Candles[i], f.Candles[i])
 		}
 	}
-	// Same seed => same dataset (the "same algo" guarantee).
-	if again := Generate("BTCUSDT", 42, 3, now, 6_500_000, tick); again.Candles[100] != f.Candles[100] {
-		t.Fatal("generation not deterministic")
-	}
 }
 
-func TestRebaseEndsAtCurrentMinute(t *testing.T) {
-	f := Generate("BTCUSDT", 1, 1, 1_000_000_020_000, 6_500_000, tick) // generated in the past
-	now := int64(1_790_000_123_456)
-	cs := Rebase(f.ToCandles(), now)
-	last := cs[len(cs)-1]
-	if last.Start+60_000 != now-now%60_000 {
-		t.Fatalf("last candle %d does not end at current minute %d", last.Start, now-now%60_000)
+// The file and the live function are one series: loading an older file and
+// filling up to now gives exactly what computing everything would give.
+func TestWindowEqualsFunction(t *testing.T) {
+	nowTick := generator.TickAt(now)
+	older := Generate("BTCUSDT", mdl, 1, now-3*3600*1000) // generated 3 h ago
+	got := Window(older.ToCandles(), mdl, 1, nowTick)
+	want := Window(nil, mdl, 1, nowTick)
+	if len(got) != len(want) {
+		t.Fatalf("len %d != %d", len(got), len(want))
 	}
-	for i := 1; i < len(cs); i++ {
-		if cs[i].Start-cs[i-1].Start != 60_000 || cs[i].Start%60_000 != 0 {
-			t.Fatalf("rebased candles not contiguous/aligned at %d", i)
+	for i := range want {
+		g, w := got[i], want[i]
+		if g.Start != w.Start || g.Open != w.Open || g.High != w.High || g.Low != w.Low || g.Close != w.Close || g.Volume != w.Volume || g.CloseSeq != w.CloseSeq {
+			t.Fatalf("candle %d differs: file %+v vs function %+v", i, g, w)
 		}
 	}
-	if cs[0].Open != f.Candles[0][1] || last.Close != 6_500_000 {
-		t.Fatal("rebase must not change prices")
+	last := got[len(got)-1]
+	if last.Start != now-now%minute {
+		t.Fatalf("last candle %d should be the partial current minute %d", last.Start, now-now%minute)
 	}
 }
 
 func TestValidateRejectsBadFiles(t *testing.T) {
-	good := func() File { return Generate("BTCUSDT", 42, 1, 1_790_000_000_000, 6_500_000, tick) }
+	good := func() File { return Generate("BTCUSDT", mdl, 1, now) }
 	cases := map[string]func(*File){
 		"wrong symbol": func(f *File) { f.Symbol = "ETHUSDT" },
 		"wrong tick":   func(f *File) { f.TickSize = 1 },
+		"wrong base":   func(f *File) { f.BasePrice = 1 },
+		"wrong model":  func(f *File) { f.Generator = "random" },
 		"wrong scale":  func(f *File) { f.PriceScale = 1 },
 		"empty":        func(f *File) { f.Candles = nil },
 		"gap":          func(f *File) { f.Candles = append(f.Candles[:10:10], f.Candles[11:]...) },
 		"unaligned":    func(f *File) { f.Candles[0][0] += 1 },
-		"bad ohlc":     func(f *File) { f.Candles[5][2] = f.Candles[5][3] - 1 }, // high < low
+		"bad ohlc":     func(f *File) { f.Candles[5][2] = f.Candles[5][3] - 1 },
 		"neg volume":   func(f *File) { f.Candles[5][5] = -1 },
 	}
 	for name, mutate := range cases {
 		f := good()
 		mutate(&f)
-		if err := Validate(f, "BTCUSDT", tick); !errors.Is(err, ErrInvalid) {
+		if err := Validate(f, "BTCUSDT", mdl); !errors.Is(err, ErrInvalid) {
 			t.Errorf("%s: want ErrInvalid, got %v", name, err)
 		}
 	}

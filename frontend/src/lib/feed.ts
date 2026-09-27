@@ -3,13 +3,14 @@
 // React only sees its output through the store (committed once per frame).
 import { api, HISTORY_LIMIT, type BookSnapshot, type CandlesResponse } from "./api";
 import { LatencyMeter, RateCounter } from "./latency";
-import { decode, encodePing, MalformedPacketError, type ChartDelta, type DepthDelta, type TradeUpdate } from "./protocol";
+import { decodeFrame, encodePing, type ChartDelta, type DepthDelta, type Packet, type TradeUpdate } from "./protocol";
 import { applyDepthDelta, type BookState } from "./sync/book";
 import { applyChartDelta, normalizeCandles, type ChartState } from "./sync/chart";
 import { StreamSync } from "./sync/streamSync";
-import { commit, initialState, type LogEvent, type Override, type Patch, type Rates, type TierName } from "@/store/market";
+import { commit, initialState, useMarket, type LogEvent, type MarketState, type Override, type Patch, type Rates, type TierName } from "@/store/market";
 
 const PING_EVERY_MS = 1000;
+const FAST_START_MS = [200, 400];
 const TICKER_EVERY_MS = 30_000;
 const MAX_BACKOFF_MS = 10_000;
 
@@ -237,16 +238,12 @@ export class FeedClient {
   }
 
   private onBinary(buf: ArrayBuffer) {
-    let p;
-    try {
-      p = decode(buf);
-    } catch (e) {
-      if (e instanceof MalformedPacketError) {
-        this.log(`malformed packet dropped: ${e.message}`, "warn");
-        return;
-      }
-      throw e;
-    }
+    const { packets, error } = decodeFrame(buf);
+    for (const p of packets) this.onPacket(p);
+    if (error) this.log(`malformed packet dropped: ${error}`, "warn");
+  }
+
+  private onPacket(p: Packet) {
     const now = performance.now();
     switch (p.kind) {
       case "depth":
@@ -278,9 +275,13 @@ export class FeedClient {
       conn: { status: "live", connId: String(m.connId), disconnectedAt: null, reconnectAt: null, attempt: 0 },
       tier: { table: m.tiers as Record<TierName, Rates> },
     });
+    if (m.clock) useMarket.setState({ clock: m.clock as MarketState["clock"] });
+    // Fast start: 3 probes 200 ms apart fill the server's warmup window (3
+    // samples), so the first tier is decided in ~0.6 s; then 1 probe/s.
     this.probeSeq = 0;
-    this.pingTimer = setInterval(() => this.ping(), PING_EVERY_MS);
     this.ping();
+    for (const at of FAST_START_MS) this.retry(() => this.ping(), at);
+    this.pingTimer = setInterval(() => this.ping(), PING_EVERY_MS);
     this.depth.start("initial");
     this.subscribeChart("initial");
     this.fetchTicker();
@@ -298,6 +299,8 @@ export class FeedClient {
         reason: String(m.reason ?? ""),
         rates: m.rates as Rates,
         serverEffectiveMs: Number(m.effectiveLatencyMs ?? 0),
+        medianMs: Number(m.medianMs ?? 0),
+        madMs: Number(m.madMs ?? 0),
         warmedUp: Boolean(m.warmedUp),
       },
     });
@@ -431,6 +434,11 @@ export class FeedClient {
     this.simLatencyMs = ms;
     this.queue({ debug: { simLatencyMs: ms } });
     this.send({ type: "DEBUG", action: "SIM_LATENCY", ms });
+  }
+
+  /** Delay exactly one PONG by 900 ms: a single outlier the tier must ignore. */
+  spike() {
+    this.send({ type: "DEBUG", action: "SPIKE" });
   }
 
   dropPacket(stream: "depth" | "chart") {

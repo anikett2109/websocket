@@ -1,8 +1,9 @@
 // Package candle maintains canonical OHLCV candles for one interval.
 //
-// Every trade is one canonical chart state transition; the chart sequence is the
-// trade id. The series keeps a ring of recent states so a delivery layer can
-// compute a coalesced transition from any recent base sequence to the current one.
+// The chart sequence is the market tick (see generator): the canonical chart
+// state's seq is the tick of the last trade applied. The series keeps a ring of
+// recent states keyed by that tick so a delivery layer can compute a coalesced
+// transition from any recent base sequence to the current one.
 //
 // Series is not safe for concurrent use; the market package owns locking.
 package candle
@@ -23,7 +24,7 @@ type Series struct {
 	closed     []model.Candle // oldest first
 	active     model.Candle   // Start==0 means none
 	lastSeq    uint32
-	initial    model.ChartState // state at seq 0 (before any live trade)
+	initial    model.ChartState // seeded state (before any live trade)
 	ring       []model.ChartState
 }
 
@@ -35,16 +36,21 @@ func NewSeries(name string, intervalMs int64, maxHistory, ringSize int) *Series 
 	}
 }
 
-// Seed installs synthetic history. active may be zero-valued (no active candle).
-func (s *Series) Seed(closed []model.Candle, active model.Candle) {
+// Seed installs history and the state at sequence seq. active may be
+// zero-valued (no active candle).
+func (s *Series) Seed(closed []model.Candle, active model.Candle, seq uint32) {
 	s.closed = append([]model.Candle(nil), closed...)
 	s.trim()
 	s.active = active
-	s.initial = model.ChartState{Seq: 0, Candle: active}
+	s.active.CloseSeq = seq
+	s.lastSeq = seq
+	s.initial = model.ChartState{Seq: seq, Candle: s.active}
 }
 
-// OnTrade applies one trade. Trades must arrive in id order.
-func (s *Series) OnTrade(t model.Trade) {
+// OnTrade applies one trade that happened at chart sequence (tick) seq.
+// Trades must arrive in order; several trades may share a tick, in which case
+// the ring keeps the state after the last of them.
+func (s *Series) OnTrade(t model.Trade, seq uint32) {
 	start := t.TS - t.TS%s.IntervalMs
 	switch {
 	case s.active.Start == 0 || start > s.active.Start:
@@ -62,9 +68,9 @@ func (s *Series) OnTrade(t model.Trade) {
 		s.active.Close = t.Price
 		s.active.Volume += t.Qty
 	}
-	s.lastSeq = t.ID
-	s.active.CloseSeq = t.ID
-	s.ring[int(t.ID)%len(s.ring)] = model.ChartState{Seq: t.ID, Candle: s.active}
+	s.lastSeq = seq
+	s.active.CloseSeq = seq
+	s.ring[int(seq)%len(s.ring)] = model.ChartState{Seq: seq, Candle: s.active}
 }
 
 func (s *Series) trim() {
@@ -87,7 +93,7 @@ func (s *Series) History(limit int) []model.Candle {
 
 // StateAt returns the canonical state after chart sequence seq.
 func (s *Series) StateAt(seq uint32) (model.ChartState, bool) {
-	if seq == 0 {
+	if seq == s.initial.Seq {
 		return s.initial, true
 	}
 	if seq > s.lastSeq {

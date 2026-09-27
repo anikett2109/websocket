@@ -41,7 +41,9 @@ export interface MarketState {
     override: Override;
     reason: string;
     rates: Rates | null;
-    serverEffectiveMs: number;
+    serverEffectiveMs: number; // L = median + 4·MAD of the last 5 RTTs (server)
+    medianMs: number;
+    madMs: number;
     warmedUp: boolean;
     table: Record<TierName, Rates> | null;
   };
@@ -61,12 +63,15 @@ export interface MarketState {
   };
   trades: { list: Trade[]; newestId: number; updatedAt: number };
   debug: { simLatencyMs: number };
+  /** Market clock from HELLO: tick n = ⌊(t − epoch)/tickMs⌋, regime by n mod cycleTicks. */
+  clock: { epochMs: number; tickMs: number; cycleTicks: number; normalEnd: number; burstEnd: number } | null;
   events: LogEvent[];
 }
 
 export const initialState: MarketState = {
   conn: { status: "connecting", connId: null, lastMessageAt: 0, disconnectedAt: null, reconnectAt: null, attempt: 0, paused: false },
-  tier: { tier: null, autoTier: null, override: "AUTO", reason: "", rates: null, serverEffectiveMs: 0, warmedUp: false, table: null },
+  tier: { tier: null, autoTier: null, override: "AUTO", reason: "", rates: null, serverEffectiveMs: 0, medianMs: 0, madMs: 0, warmedUp: false, table: null },
+  clock: null,
   net: { rttMs: 0, srttMs: 0, rttvarMs: 0, effectiveMs: 0, samples: 0 },
   measured: { chart: 0, depth: 0, trades: 0 },
   ticker: { ltp: null, ltpSeq: 0, dir: 0, open24h: null, high24h: null, low24h: null, volume24h: null },

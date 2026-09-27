@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { fmtChangePct, fmtPrice, fmtQty } from "@/lib/fixed";
 import { useMarket } from "@/store/market";
+import { RegimeBadge } from "./RegimeBadge";
 
 export function TopBar() {
   const t = useMarket((s) => s.ticker);
@@ -30,7 +31,8 @@ export function TopBar() {
       <Stat label="24h low" stale={!live}>{t.low24h !== null ? fmtPrice(t.low24h) : "—"}</Stat>
       <Stat label="24h volume (BTC)" stale={!live}>{t.volume24h !== null ? fmtQty(t.volume24h, 2) : "—"}</Stat>
 
-      <div className="ml-auto">
+      <div className="ml-auto flex items-center gap-6">
+        <RegimeBadge />
         <ConnectionBadge />
       </div>
     </header>

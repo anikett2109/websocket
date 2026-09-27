@@ -127,6 +127,31 @@ export function decode(buf: ArrayBuffer): Packet {
   }
 }
 
+/**
+ * Decode one WebSocket binary frame. The server batches every packet that is
+ * due on the same 50 ms tick into one frame; packets are self-delimiting via
+ * the header length field. Decoding stops at the first malformed packet (the
+ * framing after it cannot be trusted); packets before it are returned.
+ */
+export function decodeFrame(buf: ArrayBuffer): { packets: Packet[]; error?: string } {
+  const packets: Packet[] = [];
+  const v = new DataView(buf);
+  let off = 0;
+  while (off < buf.byteLength) {
+    if (buf.byteLength - off < Sizes.header) return { packets, error: `trailing ${buf.byteLength - off} bytes` };
+    const len = v.getUint16(off + 1, true);
+    if (len < Sizes.header || off + len > buf.byteLength) return { packets, error: `bad packet length ${len} at ${off}` };
+    try {
+      packets.push(decode(buf.slice(off, off + len)));
+    } catch (e) {
+      if (e instanceof MalformedPacketError) return { packets, error: e.message };
+      throw e;
+    }
+    off += len;
+  }
+  return { packets };
+}
+
 /** PING: header only; ts is the client's clock in microseconds, echoed by the server. */
 export function encodePing(seq: number, tsMicros: number): ArrayBuffer {
   const buf = new ArrayBuffer(Sizes.probe);

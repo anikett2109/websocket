@@ -35,7 +35,7 @@ export function TierPanel() {
             ) : tier.warmedUp ? (
               "automatic"
             ) : (
-              `warming up (${Math.min(net.samples, 5)}/5 probes)`
+              `warming up (${Math.min(net.samples, 3)}/3 probes)`
             )}
           </span>
         </div>
@@ -73,11 +73,15 @@ export function TierPanel() {
 
         <div className="grid grid-cols-2 gap-x-4 gap-y-1 border-t border-line pt-3 text-xs">
           <Metric label="Last RTT" v={`${f1(net.rttMs)} ms`} />
-          <Metric label="SRTT" v={`${f1(net.srttMs)} ms`} />
+          <Metric label="Latency (SRTT)" v={`${f1(net.srttMs)} ms`} />
           <Metric label="Jitter (RTTVAR)" v={`${f1(net.rttvarMs)} ms`} />
-          <Metric label="E = SRTT + 4·RTTVAR" v={`${f1(net.effectiveMs)} ms`} strong />
+          <Metric label="Median₅ · MAD₅" v={`${f1(tier.medianMs)} · ${f1(tier.madMs)}`} />
         </div>
-        <Thresholds effective={net.effectiveMs} />
+        <div className="flex justify-between rounded-md bg-panel-2 px-2 py-1.5 text-xs">
+          <span className="text-muted">Server score L = median₅ + 4·MAD₅</span>
+          <span className="num font-semibold">{f1(tier.serverEffectiveMs)} ms</span>
+        </div>
+        <Thresholds score={tier.serverEffectiveMs} />
       </div>
     </section>
   );
@@ -92,13 +96,15 @@ function Metric({ label, v, strong }: { label: string; v: string; strong?: boole
   );
 }
 
-function Thresholds({ effective }: { effective: number }) {
+// Threshold = 2 × the tier's chart interval (at most one update in flight);
+// promotion at 80 % of it (20 % dead band). Demote after 3 reports, promote after 5.
+function Thresholds({ score }: { score: number }) {
   const rows: [TierName, string, string][] = [
-    ["FULL", "E < 100 ms", "promote at E < 80 ms ×5"],
-    ["DEGRADED", "100 ≤ E < 250 ms", "demote at ≥ 100 ×3 / ≥ 250 ×3"],
-    ["MINIMAL", "E ≥ 250 ms", "promote at E < 200 ms ×5"],
+    ["FULL", "L < 200 ms (2×100)", "back to FULL at L < 160 ×5"],
+    ["DEGRADED", "200 ≤ L < 600 (2×300)", "demote at ≥ 200 ×3 / ≥ 600 ×3"],
+    ["MINIMAL", "L ≥ 600 ms", "back to DEGRADED at L < 480 ×5"],
   ];
-  const band: TierName = effective < 100 ? "FULL" : effective < 250 ? "DEGRADED" : "MINIMAL";
+  const band: TierName = score < 200 ? "FULL" : score < 600 ? "DEGRADED" : "MINIMAL";
   return (
     <div className="rounded-md border border-line text-[11px]">
       {rows.map(([t, range, rule]) => (
@@ -140,13 +146,26 @@ export function DebugPanel() {
           </div>
         </div>
         <div>
-          <div className="mb-1 text-muted">Simulated latency (server delays PONGs; exercises automatic tiering)</div>
-          <div className="inline-flex flex-wrap rounded-md bg-panel-2 p-0.5">
-            {[0, 60, 150, 400].map((ms) => (
-              <button key={ms} disabled={!live} className={seg(sim === ms)} onClick={() => feed?.setSimLatency(ms)}>
-                {ms === 0 ? "off" : `+${ms} ms`}
-              </button>
-            ))}
+          <div className="mb-1 text-muted">
+            Simulated latency: the server delays PONGs so the automatic tiering reacts. Presets aim L at the middle of each band.
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex flex-wrap rounded-md bg-panel-2 p-0.5">
+              {(
+                [
+                  [0, "off"],
+                  [300, "+300 ms → DEGRADED"],
+                  [700, "+700 ms → MINIMAL"],
+                ] as const
+              ).map(([ms, label]) => (
+                <button key={ms} disabled={!live} className={seg(sim === ms)} onClick={() => feed?.setSimLatency(ms)}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button className={btn} disabled={!live} onClick={() => feed?.spike()} title="Delays one PONG by 900 ms; the median ignores it">
+              Spike (tier should hold)
+            </button>
           </div>
         </div>
         <div>

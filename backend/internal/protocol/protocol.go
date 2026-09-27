@@ -173,3 +173,22 @@ func EncodeProbe(typ uint8, seq uint32, ts int64) []byte {
 	putHeader(b, typ, seq, ts)
 	return b
 }
+
+// SplitFrame splits one WebSocket binary frame into its packets. A hub batches
+// every packet due on the same tick into one frame; the header length field
+// makes packets self-delimiting.
+func SplitFrame(b []byte) ([][]byte, error) {
+	var out [][]byte
+	for len(b) > 0 {
+		if len(b) < HeaderSize {
+			return out, fmt.Errorf("%w: %d trailing bytes", ErrMalformed, len(b))
+		}
+		n := int(le.Uint16(b[1:]))
+		if n < HeaderSize || n > len(b) {
+			return out, fmt.Errorf("%w: packet length %d with %d bytes left", ErrMalformed, n, len(b))
+		}
+		out = append(out, b[:n])
+		b = b[n:]
+	}
+	return out, nil
+}

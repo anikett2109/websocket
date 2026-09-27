@@ -1,9 +1,10 @@
-// Package history reads and writes the historical candle data file that the
+// Package history reads and writes the historical candle file that the
 // backend loads into its candle cache at startup.
 //
-// The file holds 1m candles only; 5m (and any other interval) is aggregated
-// from them at load time, so all intervals are consistent. Values are
-// fixed-point integers (price x PriceScale, qty x QtyScale).
+// The file holds 1m candles sampled from the same deterministic market
+// function the live generator uses (generator.Model), so history and live data
+// are one continuous series. 5m (and any other interval) is aggregated from
+// the 1m candles at load time. Values are fixed-point integers.
 package history
 
 import (
@@ -19,7 +20,10 @@ import (
 	"cryptofeed/internal/model"
 )
 
-const minute = int64(60_000)
+const (
+	minute    = int64(60_000)
+	Generator = "tick-v1" // identifies the market function that produced the file
+)
 
 // File is the on-disk format. Each candle is [t, o, h, l, c, v] with t the
 // candle start in unix ms.
@@ -29,18 +33,22 @@ type File struct {
 	PriceScale  int64      `json:"priceScale"`
 	QtyScale    int64      `json:"qtyScale"`
 	TickSize    int64      `json:"tickSize"`
-	Seed        int64      `json:"seed"`
+	BasePrice   int64      `json:"basePrice"`
+	Generator   string     `json:"generator"`
 	GeneratedAt int64      `json:"generatedAt"`
 	Candles     [][6]int64 `json:"candles"`
 }
 
-// Generate builds `days` of 1m candles ending just before endMs's minute, using
-// the same deterministic algorithm the generator uses, closing at endPrice.
-func Generate(symbol string, seed int64, days int, endMs, endPrice, tick int64) File {
-	cs := generator.History(seed, days*24*60, endMs-endMs%minute, endPrice, tick)
+// Generate samples `days` of complete 1m candles ending at the minute boundary
+// at or before endMs.
+func Generate(symbol string, m generator.Model, days int, endMs int64) File {
+	end := endMs - endMs%minute
+	start := end - int64(days)*24*60*minute
+	cs := m.Candles(generator.TickAt(start), generator.TickAt(end), minute)
 	f := File{
 		Symbol: symbol, Interval: "1m", PriceScale: model.PriceScale, QtyScale: model.QtyScale,
-		TickSize: tick, Seed: seed, GeneratedAt: endMs, Candles: make([][6]int64, len(cs)),
+		TickSize: m.Tick, BasePrice: m.Base, Generator: Generator, GeneratedAt: endMs,
+		Candles: make([][6]int64, len(cs)),
 	}
 	for i, c := range cs {
 		f.Candles[i] = [6]int64{c.Start, c.Open, c.High, c.Low, c.Close, c.Volume}
@@ -65,9 +73,10 @@ func Save(path string, f File) error {
 		PriceScale  int64  `json:"priceScale"`
 		QtyScale    int64  `json:"qtyScale"`
 		TickSize    int64  `json:"tickSize"`
-		Seed        int64  `json:"seed"`
+		BasePrice   int64  `json:"basePrice"`
+		Generator   string `json:"generator"`
 		GeneratedAt int64  `json:"generatedAt"`
-	}{f.Symbol, f.Interval, f.PriceScale, f.QtyScale, f.TickSize, f.Seed, f.GeneratedAt})
+	}{f.Symbol, f.Interval, f.PriceScale, f.QtyScale, f.TickSize, f.BasePrice, f.Generator, f.GeneratedAt})
 	w.Write(head[:len(head)-1]) // drop the closing brace; candles follow
 	w.WriteString(`,"candles":[` + "\n")
 	for i, c := range f.Candles {
@@ -106,9 +115,9 @@ func Load(path string) (File, error) {
 
 var ErrInvalid = errors.New("history: invalid file")
 
-// Validate checks the file matches this service's symbol, scales and tick,
-// and that candles are contiguous, minute-aligned and internally consistent.
-func Validate(f File, symbol string, tick int64) error {
+// Validate checks the file matches this service's symbol, scales and market
+// model, and that candles are contiguous, minute-aligned and consistent.
+func Validate(f File, symbol string, m generator.Model) error {
 	bad := func(format string, a ...any) error {
 		return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, a...))
 	}
@@ -119,8 +128,9 @@ func Validate(f File, symbol string, tick int64) error {
 		return bad("interval %q, want 1m", f.Interval)
 	case f.PriceScale != model.PriceScale || f.QtyScale != model.QtyScale:
 		return bad("scales %d/%d, want %d/%d", f.PriceScale, f.QtyScale, model.PriceScale, model.QtyScale)
-	case f.TickSize != tick:
-		return bad("tick size %d, want %d", f.TickSize, tick)
+	case f.TickSize != m.Tick || f.BasePrice != m.Base || f.Generator != Generator:
+		return bad("market model (tick %d, base %d, %q) does not match the server (tick %d, base %d, %q); regenerate with `go run ./cmd/gendata`",
+			f.TickSize, f.BasePrice, f.Generator, m.Tick, m.Base, Generator)
 	case len(f.Candles) == 0:
 		return bad("no candles")
 	}
@@ -139,28 +149,35 @@ func Validate(f File, symbol string, tick int64) error {
 	return nil
 }
 
-// ToCandles converts the file rows to model candles.
+// ToCandles converts the file rows to model candles. CloseSeq (the tick of
+// the last trade in each minute) is derived from the market clock.
 func (f File) ToCandles() []model.Candle {
 	out := make([]model.Candle, len(f.Candles))
 	for i, c := range f.Candles {
-		out[i] = model.Candle{Start: c[0], Open: c[1], High: c[2], Low: c[3], Close: c[4], Volume: c[5]}
+		out[i] = model.Candle{Start: c[0], Open: c[1], High: c[2], Low: c[3], Close: c[4], Volume: c[5],
+			CloseSeq: generator.LastTradeTick(generator.TickAt(c[0]+minute) - 1)}
 	}
 	return out
 }
 
-// Rebase shifts candle times by a whole number of minutes so the last candle
-// ends exactly at the start of nowMs's minute. The file is a fixed dataset
-// generated at some past time; rebasing makes it read as "the last 3 days"
-// and lets live trading continue seamlessly from its final close.
-func Rebase(cs []model.Candle, nowMs int64) []model.Candle {
-	if len(cs) == 0 {
-		return cs
+// Window returns 1m candles covering [startTick's minute, nowTick): the file's
+// candles inside that window, plus candles computed from the market function
+// for any minutes the file does not cover (e.g. the file was generated
+// earlier, or the partial current minute). The last candle may be partial.
+func Window(fileCandles []model.Candle, m generator.Model, days int, nowTick uint32) []model.Candle {
+	now := generator.TickTime(nowTick)
+	from := now - now%minute - int64(days)*24*60*minute
+	var out []model.Candle
+	for _, c := range fileCandles {
+		if c.Start >= from && c.Start+minute <= now-now%minute {
+			out = append(out, c)
+		}
 	}
-	shift := (nowMs - nowMs%minute) - (cs[len(cs)-1].Start + minute)
-	out := make([]model.Candle, len(cs))
-	for i, c := range cs {
-		c.Start += shift
-		out[i] = c
+	if len(out) == 0 {
+		return m.Candles(generator.TickAt(from), nowTick, minute)
 	}
-	return out
+	// File candles are contiguous (Validate); compute whatever lies before and after them.
+	before := m.Candles(generator.TickAt(from), generator.TickAt(out[0].Start), minute)
+	after := m.Candles(generator.TickAt(out[len(out)-1].Start+minute), nowTick, minute)
+	return append(append(before, out...), after...)
 }

@@ -128,10 +128,20 @@ run("FeedClient against a live backend", () => {
     await expectChartMatchesServer("5m");
   }, 40_000);
 
-  it("automatic tiering: simulated latency demotes, removing it promotes", async () => {
-    client.setSimLatency(400);
+  it("a single latency spike does not change the tier (robust median)", async () => {
+    await wait("FULL on localhost", () => s().tier.autoTier === "FULL", 20_000);
+    const changes = s().events.filter((e: Any) => String(e.msg).startsWith("tier ->")).length;
+    client.spike();
+    await new Promise((r) => setTimeout(r, 6000));
+    expect(s().tier.autoTier).toBe("FULL");
+    expect(s().events.filter((e: Any) => String(e.msg).startsWith("tier ->")).length).toBe(changes);
+  }, 40_000);
+
+  it("automatic tiering: +700 ms demotes to MINIMAL, removing it promotes", async () => {
+    client.setSimLatency(700); // L ≈ 700 ≥ 600
     await wait("auto MINIMAL", () => s().tier.autoTier === "MINIMAL", 25_000);
     client.setSimLatency(0);
-    await wait("promotion to DEGRADED", () => s().tier.autoTier === "DEGRADED", 60_000);
-  }, 120_000);
+    await wait("promotion to DEGRADED", () => s().tier.autoTier === "DEGRADED", 20_000);
+    await wait("promotion to FULL", () => s().tier.autoTier === "FULL", 20_000);
+  }, 90_000);
 });

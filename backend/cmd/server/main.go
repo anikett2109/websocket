@@ -51,28 +51,29 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	now := time.Now().UnixMilli()
-	past, err := loadHistory(cfg, now)
+	// Everything is a function of the market tick; live processing starts at n0.
+	mdl := generator.Model{Base: cfg.BasePrice, Tick: cfg.TickSize}
+	n0 := generator.TickAt(time.Now().UnixMilli())
+	past, err := loadHistory(cfg, mdl, n0)
 	if err != nil {
 		fatal("load history", "file", cfg.HistoryFile, "err", err)
 	}
-	// Live trading continues from the last historical close.
-	startPrice := past[len(past)-1].Close
-	startPrice -= startPrice % cfg.TickSize
-
-	gen := generator.New(generator.Config{
-		Seed: cfg.Seed, StartPrice: startPrice, TickSize: cfg.TickSize, DepthSkipPct: cfg.DepthSkipPct,
-	})
 	mkt := market.New(market.Config{
-		Symbol: cfg.Symbol, StartPrice: startPrice, TickSize: cfg.TickSize,
+		Symbol: cfg.Symbol, BasePrice: cfg.BasePrice, TickSize: cfg.TickSize,
 		HistoryCandles: cfg.HistoryCandles, TradeBuffer: cfg.TradeBuffer, StateRing: cfg.StateRing,
 	})
-	if err := mkt.Seed(past, now, gen.Book()); err != nil {
+	// Recent trades (the ring's worth, oldest first) so /api/trades and the
+	// latest-10 panel are populated immediately, identically after a restart.
+	var recent []model.Trade
+	for n := n0 - min(n0, uint32(cfg.TradeBuffer)); n < n0; n++ {
+		recent = append(recent, mdl.Trades(n)...)
+	}
+	if err := mkt.Seed(past, generator.TickTime(n0), generator.LastTradeTick(n0-1), recent, mdl.Book(n0-1)); err != nil {
 		fatal("seed market", "err", err)
 	}
 
 	events := make(chan generator.Event, 1024)
-	go gen.Run(ctx, cfg.TradeInterval, events)
+	go generator.New(mdl, n0).Run(ctx, events)
 	go mkt.Run(ctx, events)
 
 	wsSrv := ws.NewServer(cfg, mkt)
@@ -87,7 +88,7 @@ func main() {
 
 	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		slog.Info("backend listening", "addr", srv.Addr, "ws", cfg.WSPath, "symbol", cfg.Symbol, "seed", cfg.Seed)
+		slog.Info("backend listening", "addr", srv.Addr, "ws", cfg.WSPath, "symbol", cfg.Symbol, "tick", n0)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("http server", "err", err)
 			stop()
@@ -109,24 +110,30 @@ func fatal(msg string, args ...any) {
 	os.Exit(1)
 }
 
-// loadHistory reads the 1m history file into memory and rebases it so it ends
-// at the current minute. If the file does not exist, the same dataset is
-// generated in memory (same algorithm and seed); a file that exists but is
-// invalid is a startup error rather than being silently replaced.
-func loadHistory(cfg config.Config, now int64) ([]model.Candle, error) {
+// loadHistory reads the 3-day 1m history file and completes it up to tick n0
+// (including the partial current minute) from the same market function, so
+// file, gap and live data form one continuous series. A missing file means
+// everything is computed; a file that exists but is invalid is a startup error.
+func loadHistory(cfg config.Config, mdl generator.Model, n0 uint32) ([]model.Candle, error) {
+	const days = 3
+	var fromFile []model.Candle
 	f, err := history.Load(cfg.HistoryFile)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		slog.Warn("history file not found; generating 3 days in memory (run `go run ./cmd/gendata` to create it)", "file", cfg.HistoryFile)
-		f = history.Generate(cfg.Symbol, cfg.Seed, 3, now, cfg.StartPrice, cfg.TickSize)
+		slog.Warn("history file not found; computing 3 days from the market function (run `go run ./cmd/gendata` to create it)", "file", cfg.HistoryFile)
 	case err != nil:
 		return nil, err
+	default:
+		if err := history.Validate(f, cfg.Symbol, mdl); err != nil {
+			return nil, err
+		}
+		fromFile = f.ToCandles()
 	}
-	if err := history.Validate(f, cfg.Symbol, cfg.TickSize); err != nil {
-		return nil, err
+	cs := history.Window(fromFile, mdl, days, n0)
+	if len(cs) == 0 {
+		return nil, errors.New("no history")
 	}
-	cs := history.Rebase(f.ToCandles(), now)
-	slog.Info("history loaded", "file", cfg.HistoryFile, "candles_1m", len(cs), "seed", f.Seed,
+	slog.Info("history loaded", "file", cfg.HistoryFile, "file_candles", len(fromFile), "candles_1m", len(cs),
 		"from", time.UnixMilli(cs[0].Start).Format(time.RFC3339), "last_close", cs[len(cs)-1].Close)
 	return cs, nil
 }

@@ -28,7 +28,7 @@ var Intervals = map[string]int64{"1m": 60_000, "5m": 300_000}
 
 type Config struct {
 	Symbol         string
-	StartPrice     int64
+	BasePrice      int64
 	TickSize       int64
 	HistoryCandles int
 	TradeBuffer    int
@@ -49,6 +49,36 @@ type Market struct {
 
 	tradeCount atomic.Uint64
 	depthCount atomic.Uint64
+
+	subMu sync.Mutex
+	subs  []chan uint32
+}
+
+// Subscribe returns a channel that receives each processed market tick. The
+// delivery hubs flush on these ticks, so they sample the canonical state
+// exactly on the market clock (a slow reader only ever sees the newest tick).
+func (m *Market) Subscribe() <-chan uint32 {
+	ch := make(chan uint32, 1)
+	m.subMu.Lock()
+	m.subs = append(m.subs, ch)
+	m.subMu.Unlock()
+	return ch
+}
+
+func (m *Market) publish(n uint32) {
+	m.subMu.Lock()
+	defer m.subMu.Unlock()
+	for _, ch := range m.subs {
+		select {
+		case ch <- n:
+		default: // reader is behind: replace the pending tick with the newest
+			select {
+			case <-ch:
+			default:
+			}
+			ch <- n
+		}
+	}
 }
 
 func New(cfg Config) *Market {
@@ -56,7 +86,7 @@ func New(cfg Config) *Market {
 		cfg:    cfg,
 		series: map[string]*candle.Series{},
 		trades: trades.NewStore(cfg.TradeBuffer),
-		ltp:    cfg.StartPrice - cfg.StartPrice%cfg.TickSize,
+		ltp:    cfg.BasePrice - cfg.BasePrice%cfg.TickSize,
 		book:   orderbook.NewEngine(cfg.TickSize, cfg.StateRing),
 	}
 	for name, ms := range Intervals {
@@ -68,12 +98,12 @@ func New(cfg Config) *Market {
 func (m *Market) Symbol() string  { return m.cfg.Symbol }
 func (m *Market) TickSize() int64 { return m.cfg.TickSize }
 
-// Seed loads 1m history (oldest first, ending before nowMs's minute) into the
-// candle cache, aggregating every other interval from it, and installs the
-// initial book. Live trading then continues from the last close.
-func (m *Market) Seed(oneMin []model.Candle, nowMs int64, initial model.Book) error {
-	const minute = int64(60_000)
-
+// Seed installs the state as of just before live tick processing starts at
+// time nowMs: 1m history (oldest first; the last candle may be the partial
+// current minute), the chart sequence of that state, the most recent trades
+// (oldest first) and the book. Other intervals are aggregated from the 1m
+// candles; a candle whose window contains nowMs becomes the active candle.
+func (m *Market) Seed(oneMin []model.Candle, nowMs int64, chartSeq uint32, recent []model.Trade, initial model.Book) error {
 	m.mu.Lock()
 	if n := len(oneMin); n > 0 {
 		m.ltp = oneMin[n-1].Close
@@ -81,10 +111,14 @@ func (m *Market) Seed(oneMin []model.Candle, nowMs int64, initial model.Book) er
 	for name, ms := range Intervals {
 		all := generator.Aggregate(oneMin, ms)
 		var active model.Candle
-		if n := len(all); n > 0 && all[n-1].Start == nowMs-nowMs%ms && ms != minute {
-			active, all = all[n-1], all[:n-1] // current window already has synthetic minutes
+		if n := len(all); n > 0 && all[n-1].Start == nowMs-nowMs%ms {
+			active, all = all[n-1], all[:n-1]
 		}
-		m.series[name].Seed(all, active)
+		m.series[name].Seed(all, active, chartSeq)
+	}
+	for _, t := range recent {
+		m.trades.Add(t)
+		m.ltp, m.ltq = t.Price, t.Qty
 	}
 	m.mu.Unlock()
 
@@ -108,17 +142,22 @@ func (m *Market) Run(ctx context.Context, events <-chan generator.Event) {
 	}
 }
 
-// Process applies one generator event. Every trade updates every interval;
-// client tiers never influence this path.
+// Process applies one tick. Every trade updates every interval; client tiers
+// never influence this path. All trades of a tick are applied under one lock,
+// so readers only ever observe whole ticks (the chart sequence is the tick).
 func (m *Market) Process(ev generator.Event) {
-	m.mu.Lock()
-	for _, s := range m.series {
-		s.OnTrade(ev.Trade)
+	if len(ev.Trades) > 0 {
+		m.mu.Lock()
+		for _, t := range ev.Trades {
+			for _, s := range m.series {
+				s.OnTrade(t, ev.Tick)
+			}
+			m.trades.Add(t)
+			m.ltp, m.ltq = t.Price, t.Qty
+		}
+		m.mu.Unlock()
+		m.tradeCount.Add(uint64(len(ev.Trades)))
 	}
-	m.trades.Add(ev.Trade)
-	m.ltp, m.ltq = ev.Trade.Price, ev.Trade.Qty
-	m.mu.Unlock()
-	m.tradeCount.Add(1)
 
 	if ev.Book != nil {
 		m.bookMu.Lock()
@@ -126,10 +165,11 @@ func (m *Market) Process(ev generator.Event) {
 		m.bookMu.Unlock()
 		if err != nil {
 			slog.Warn("rejected generated book", "err", err)
-			return
+		} else {
+			m.depthCount.Add(1)
 		}
-		m.depthCount.Add(1)
 	}
+	m.publish(ev.Tick)
 }
 
 // CandlesView is a consistent snapshot of one interval for REST.
@@ -154,7 +194,7 @@ func (m *Market) Candles(interval string, limit int) (CandlesView, error) {
 	return v, nil
 }
 
-// ChartSeq returns the current canonical chart sequence (the latest trade id).
+// ChartSeq returns the current canonical chart sequence (tick of the latest trade).
 func (m *Market) ChartSeq() uint32 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

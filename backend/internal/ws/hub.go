@@ -9,26 +9,42 @@ import (
 	"cryptofeed/internal/candle"
 	"cryptofeed/internal/client"
 	"cryptofeed/internal/config"
+	"cryptofeed/internal/generator"
 	"cryptofeed/internal/protocol"
 )
 
 // Hub delivers to every client currently in one tier, on that tier's cadence.
-// All clients flushed on the same tick converge on the same base sequence, so
-// packets are encoded once per (stream, base) and shared.
+//
+// A hub is driven by the market clock itself: after the market processes tick
+// n it publishes n, and each stream fires when n is a multiple of k
+// (k = interval / τ, τ = 50 ms). A DEGRADED chart (k = 6) therefore always
+// samples ticks …, n−6, n, n+6, …. Streams that fall due together are
+// concatenated into a single binary WebSocket frame (packets are
+// self-delimiting via the header length field). All clients flushed on the same
+// tick converge on the same base sequence, so packets are encoded once per
+// (stream, base) and shared.
 //
 // A hub only reads canonical state from the market; it never computes candles
 // or owns the book.
 type Hub struct {
 	tier   client.Tier
 	rates  config.TierRates
+	every  [3]uint64 // depth, chart, trades: fire every k ticks
 	market Market
 
 	mu      sync.Mutex
 	clients map[*Client]struct{}
 }
 
+func ticksOf(d time.Duration) uint64 {
+	return max(1, uint64(d/(generator.TickMs*time.Millisecond)))
+}
+
 func newHub(t client.Tier, r config.TierRates, m Market) *Hub {
-	return &Hub{tier: t, rates: r, market: m, clients: map[*Client]struct{}{}}
+	return &Hub{
+		tier: t, rates: r, market: m, clients: map[*Client]struct{}{},
+		every: [3]uint64{ticksOf(r.Depth), ticksOf(r.Chart), ticksOf(r.Trade)},
+	}
 }
 
 func (h *Hub) add(c *Client) {
@@ -53,117 +69,133 @@ func (h *Hub) members() []*Client {
 	return out
 }
 
-func (h *Hub) run(ctx context.Context) {
-	depth := time.NewTicker(h.rates.Depth)
-	chart := time.NewTicker(h.rates.Chart)
-	trade := time.NewTicker(h.rates.Trade)
-	defer depth.Stop()
-	defer chart.Stop()
-	defer trade.Stop()
+func (h *Hub) run(ctx context.Context, ticks <-chan uint32) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-depth.C:
-			h.flushDepth()
-		case <-chart.C:
-			h.flushChart()
-		case <-trade.C:
-			h.flushTrades()
+		case t := <-ticks:
+			n := uint64(t)
+			h.flush(n%h.every[0] == 0, n%h.every[1] == 0, n%h.every[2] == 0)
 		}
 	}
 }
 
-func (h *Hub) flushDepth() {
-	cur := h.market.DepthSeq()
-	cache := map[uint32]struct {
-		pkt []byte
-		seq uint32
-	}{}
-	now := time.Now().UnixMilli()
+type depthPkt struct {
+	data []byte
+	seq  uint32
+}
+
+type chartKey struct {
+	interval string
+	base     uint32
+}
+
+// flush builds one frame per client from the streams that are due this tick.
+func (h *Hub) flush(depthDue, chartDue, tradeDue bool) {
+	if !depthDue && !chartDue && !tradeDue {
+		return
+	}
+	var (
+		curDepth   uint32
+		depthCache = map[uint32]depthPkt{}
+		chartCache = map[chartKey][]candle.Transition{}
+		tradePkt   []byte
+		newest     uint32
+		now        = time.Now().UnixMilli()
+	)
+	if depthDue {
+		curDepth = h.market.DepthSeq()
+	}
+	if tradeDue {
+		if latest := h.market.LatestTrades(protocol.TradesPerUpdate); len(latest) == protocol.TradesPerUpdate {
+			var err error
+			if tradePkt, err = protocol.EncodeTradeUpdate(latest); err != nil {
+				slog.Error("encode trades", "err", err)
+			}
+			newest = latest[0].ID
+		}
+	}
+
 	for _, c := range h.members() {
 		c.mu.Lock()
-		if c.depthSynced && c.depthSeq != cur {
-			e, ok := cache[c.depthSeq]
+		var (
+			buf                      []byte
+			depthSeq, chartSeq, tid  = c.depthSeq, c.chartSeq, c.lastTradeID
+			nDepth, nChart, nTrade   uint64
+			droppedDepth, droppedCht bool
+		)
+
+		if depthDue && c.depthSynced && c.depthSeq != curDepth {
+			p, ok := depthCache[c.depthSeq]
 			if !ok {
 				d, err := h.market.DepthDelta(c.depthSeq)
 				if err != nil {
 					c.resyncLocked("depth", err)
-					c.mu.Unlock()
-					continue
+				} else {
+					p = depthPkt{protocol.EncodeDepthDelta(d, now), d.Seq}
+					depthCache[c.depthSeq] = p
+					ok = true
 				}
-				e.pkt, e.seq = protocol.EncodeDepthDelta(d, now), d.Seq
-				cache[c.depthSeq] = e
 			}
-			switch {
-			case c.dropDepth:
-				c.dropDepth = false
-				c.depthSeq = e.seq // advance without sending: the client will see a gap
-				slog.Info("debug: dropped depth packet", "conn", c.id, "seq", e.seq)
-			case c.enqueue(frame{data: e.pkt}):
-				c.depthSeq = e.seq
-				c.stats.depth++
+			if ok {
+				depthSeq = p.seq
+				if c.dropDepth {
+					droppedDepth = true // advance without sending: the client will see a gap
+				} else {
+					buf = append(buf, p.data...)
+					nDepth++
+				}
 			}
 		}
-		c.mu.Unlock()
-	}
-}
 
-func (h *Hub) flushChart() {
-	type key struct {
-		interval string
-		base     uint32
-	}
-	cache := map[key][]candle.Transition{}
-	for _, c := range h.members() {
-		c.mu.Lock()
-		if c.chartSynced {
-			k := key{c.interval, c.chartSeq}
-			ts, ok := cache[k]
+		if chartDue && c.chartSynced {
+			k := chartKey{c.interval, c.chartSeq}
+			ts, ok := chartCache[k]
 			if !ok {
 				var err error
-				ts, err = h.market.ChartTransitions(c.interval, c.chartSeq)
-				if err != nil {
+				if ts, err = h.market.ChartTransitions(c.interval, c.chartSeq); err != nil {
 					c.resyncLocked("chart", err)
-					c.mu.Unlock()
-					continue
+				} else {
+					chartCache[k] = ts
 				}
-				cache[k] = ts
 			}
 			for _, t := range ts {
-				if c.dropChart {
-					c.dropChart = false
-					c.chartSeq = t.Seq
-					slog.Info("debug: dropped chart packet", "conn", c.id, "seq", t.Seq)
+				chartSeq = t.Seq
+				if c.dropChart && !droppedCht {
+					droppedCht = true
 					continue
 				}
-				if !c.enqueue(frame{data: protocol.EncodeChartDelta(t)}) {
-					break // buffer full: stop here, the rest coalesces into the next flush
-				}
-				c.chartSeq = t.Seq
-				c.stats.chart++
+				buf = append(buf, protocol.EncodeChartDelta(t)...)
+				nChart++
 			}
 		}
-		c.mu.Unlock()
-	}
-}
 
-func (h *Hub) flushTrades() {
-	latest := h.market.LatestTrades(protocol.TradesPerUpdate)
-	if len(latest) < protocol.TradesPerUpdate {
-		return
-	}
-	pkt, err := protocol.EncodeTradeUpdate(latest)
-	if err != nil {
-		slog.Error("encode trades", "err", err)
-		return
-	}
-	newest := latest[0].ID
-	for _, c := range h.members() {
-		c.mu.Lock()
-		if c.lastTradeID < newest && c.enqueue(frame{data: pkt}) {
-			c.lastTradeID = newest
-			c.stats.trade++
+		if tradePkt != nil && c.lastTradeID < newest {
+			buf = append(buf, tradePkt...)
+			tid = newest
+			nTrade++
+		}
+
+		// Commit only what was actually handed to the writer. A full buffer
+		// skips this flush entirely; the next one sends a larger coalesced delta.
+		if len(buf) == 0 || c.enqueue(frame{data: buf}) {
+			c.depthSeq, c.chartSeq, c.lastTradeID = depthSeq, chartSeq, tid
+			c.stats.depth += nDepth
+			c.stats.chart += nChart
+			c.stats.trade += nTrade
+			if len(buf) > 0 {
+				c.stats.frames++
+				c.stats.bytes += uint64(len(buf))
+			}
+			if droppedDepth {
+				c.dropDepth = false
+				slog.Info("debug: dropped depth packet", "conn", c.id, "seq", depthSeq)
+			}
+			if droppedCht {
+				c.dropChart = false
+				slog.Info("debug: dropped chart packet", "conn", c.id)
+			}
 		}
 		c.mu.Unlock()
 	}

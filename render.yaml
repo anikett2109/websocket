@@ -12,7 +12,5 @@ services:
     envVars:
       - key: ALLOWED_ORIGINS # e.g. https://your-app.vercel.app
         sync: false
-      - key: RANDOM_SEED
-        value: "42"
       - key: LOG_OUTPUT # Render's disk is ephemeral; stdout goes to the Logs tab
         value: stdout

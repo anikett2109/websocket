@@ -84,3 +84,16 @@ func TestMalformed(t *testing.T) {
 		t.Fatal("ping decoded as chart")
 	}
 }
+
+func TestSplitFrame(t *testing.T) {
+	chart := EncodeChartDelta(candle.Transition{BaseSeq: 1, Seq: 7, Start: 60_000})
+	depth := EncodeDepthDelta(orderbook.Delta{BaseSeq: 1, Seq: 7, BestBid: 100, BestAsk: 150}, 5)
+	frame := append(append([]byte{}, depth...), chart...)
+	parts, err := SplitFrame(frame)
+	if err != nil || len(parts) != 2 || len(parts[0]) != DepthDeltaSize || len(parts[1]) != ChartDeltaSize {
+		t.Fatalf("parts=%d err=%v", len(parts), err)
+	}
+	if _, err := SplitFrame(frame[:len(frame)-3]); err == nil {
+		t.Fatal("truncated frame accepted")
+	}
+}

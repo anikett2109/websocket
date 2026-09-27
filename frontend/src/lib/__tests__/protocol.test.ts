@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { LatencyMeter } from "../latency";
-import { decode, encodePing, MalformedPacketError, PacketType, Sizes } from "../protocol";
+import { decode, decodeFrame, encodePing, MalformedPacketError, PacketType, Sizes } from "../protocol";
 import { formatFixed, fmtChangePct } from "../fixed";
 
 function header(type: number, size: number, seq: number, ts: number) {
@@ -66,6 +66,29 @@ describe("binary protocol", () => {
     expect(ping.byteLength).toBe(Sizes.probe);
     new DataView(ping).setUint8(0, PacketType.Pong);
     expect(decode(ping)).toEqual({ kind: "pong", seq: 7, ts: 123456 });
+  });
+});
+
+describe("batched frames", () => {
+  it("splits one frame into its packets by the length field", () => {
+    const a = header(PacketType.ChartDelta, 63, 7, 60_000).buf;
+    const b = header(PacketType.Pong, 15, 3, 99).buf;
+    const frame = new Uint8Array(78);
+    frame.set(new Uint8Array(a), 0);
+    frame.set(new Uint8Array(b), 63);
+    const { packets, error } = decodeFrame(frame.buffer);
+    expect(error).toBeUndefined();
+    expect(packets.map((p) => p.kind)).toEqual(["chart", "pong"]);
+  });
+
+  it("keeps packets before a malformed one and reports the error", () => {
+    const a = header(PacketType.Pong, 15, 3, 99).buf;
+    const frame = new Uint8Array(15 + 20);
+    frame.set(new Uint8Array(a), 0);
+    frame.set([1, 200, 0], 15); // claims 200 bytes, only 20 left
+    const { packets, error } = decodeFrame(frame.buffer);
+    expect(packets).toHaveLength(1);
+    expect(error).toMatch(/bad packet length/);
   });
 });
 

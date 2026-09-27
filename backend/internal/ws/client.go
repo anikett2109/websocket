@@ -28,7 +28,7 @@ type frame struct {
 	data []byte
 }
 
-type counters struct{ depth, chart, trade uint64 }
+type counters struct{ depth, chart, trade, frames, bytes uint64 }
 
 // Client is one WebSocket connection. mu guards all mutable fields; hubs and
 // the reader goroutine both take it. Only the writer goroutine touches conn writes.
@@ -53,6 +53,9 @@ type Client struct {
 	depthSeq    uint32
 	lastTradeID uint32
 	simLatency  time.Duration
+	spikeNext   bool      // debug: delay the next PONG by SpikeDelay
+	tierSentAt  time.Time // last TIER message (keepalive every tierKeepalive)
+	tierReason  string    // reason for the last tier change, repeated in keepalives
 	dropDepth   bool
 	dropChart   bool
 	srtt        time.Duration
@@ -161,6 +164,10 @@ func (c *Client) handleBinary(b []byte) {
 	pong := frame{data: protocol.EncodeProbe(protocol.TypePong, h.Seq, h.TS)}
 	c.mu.Lock()
 	delay := c.simLatency
+	if c.spikeNext {
+		delay += SpikeDelay
+		c.spikeNext = false
+	}
 	c.mu.Unlock()
 	if delay > 0 {
 		time.AfterFunc(delay, func() { c.enqueue(pong) })
@@ -270,21 +277,28 @@ func (c *Client) sync(m controlMsg) {
 
 func validMs(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v < 60_000 }
 
+// SpikeDelay is the debug "Spike" action: one PONG delayed by 900 ms, a single
+// outlier the robust median must ignore (the tier should not change).
+const SpikeDelay = 900 * time.Millisecond
+
+// netReport feeds the probe's RTT sample to the tier machine. SRTT/RTTVAR are
+// the client's own smoothed latency/jitter, kept for display and status.
 func (c *Client) netReport(m controlMsg) {
-	if !validMs(m.SRTTMs) || !validMs(m.RTTVarMs) {
+	if !validMs(m.RTTMs) || !validMs(m.SRTTMs) || !validMs(m.RTTVarMs) {
 		c.sendError("invalid NET_REPORT values")
 		return
 	}
-	srtt := time.Duration(m.SRTTMs * float64(time.Millisecond))
-	rttvar := time.Duration(m.RTTVarMs * float64(time.Millisecond))
+	ms := func(v float64) time.Duration { return time.Duration(v * float64(time.Millisecond)) }
+	rtt := ms(m.RTTMs)
 	c.mu.Lock()
-	c.srtt, c.rttvar = srtt, rttvar
-	reason := c.machine.Report(srtt, rttvar, time.Now())
+	c.srtt, c.rttvar = ms(m.SRTTMs), ms(m.RTTVarMs)
+	reason := c.machine.Report(rtt, time.Now())
+	score := c.machine.Score()
 	c.mu.Unlock()
 	if c.srv.cfg.Debug {
-		slog.Debug("net report", "conn", c.id, "rtt_ms", m.RTTMs, "srtt", srtt, "rttvar", rttvar, "effective", srtt+4*rttvar)
+		slog.Debug("net report", "conn", c.id, "rtt", rtt, "score", score)
 	}
-	c.srv.applyTier(c, reason, true)
+	c.srv.applyTier(c, reason, false)
 }
 
 func (c *Client) debug(m controlMsg) {
@@ -301,6 +315,8 @@ func (c *Client) debug(m controlMsg) {
 			return
 		}
 		c.simLatency = time.Duration(m.Ms) * time.Millisecond
+	case "SPIKE":
+		c.spikeNext = true
 	default:
 		c.mu.Unlock()
 		c.sendError("unknown debug action " + m.Action)

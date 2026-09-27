@@ -27,12 +27,16 @@ func NewEngine(tick int64, ringSize int) *Engine {
 	return &Engine{tick: tick, ring: make([]model.Book, ringSize)}
 }
 
-// Apply validates a proposed book, assigns the next depthSeq and makes it canonical.
+// Apply validates a proposed book and makes it canonical. b.Seq is the depth
+// sequence: the market tick at which this book state was produced. It must be
+// strictly increasing; ticks without a book change simply have no state.
 func (e *Engine) Apply(b model.Book) error {
 	if err := Validate(b, e.tick); err != nil {
 		return err
 	}
-	b.Seq = e.book.Seq + 1
+	if b.Seq <= e.book.Seq && e.book.Seq != 0 {
+		return fmt.Errorf("orderbook: seq %d not after %d", b.Seq, e.book.Seq)
+	}
 	e.book = b
 	e.ring[int(b.Seq)%len(e.ring)] = b
 	return nil

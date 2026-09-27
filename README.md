@@ -14,7 +14,7 @@ frontend/   Next.js 16 (App Router) · React 19 · TypeScript · Zustand · ligh
 cd backend && go run ./cmd/server
 
 # optional: regenerate the 3-day history file the backend loads at startup
-cd backend && go run ./cmd/gendata          # -days 3 -seed 42 -close 6500000
+cd backend && go run ./cmd/gendata          # -days 3 -base 6500000 -tick 50
 
 # frontend — http://localhost:3000
 cd frontend && npm install && npm run dev
@@ -32,26 +32,87 @@ E2E_API_URL=http://localhost:8080 npm test   # + live end-to-end test (backend m
 
 ---
 
+## 0. Design in numbers: every constant and where it comes from
+
+The whole system runs on **one clock**, the market tick **τ = 50 ms** (20 Hz). Seven principles fix every other number:
+
+1. **One clock.** Every delivery interval is a whole number of ticks (k·τ). The hubs flush *on the market tick itself*, so streams that fall due together share one WebSocket frame, and coalescing ratios are exact.
+2. **FULL is lossless for depth.** FULL depth is 1τ, so every canonical book state reaches the client.
+3. **Chart intervals are geometric.** FULL = 100 ms (10 Hz: about the fastest a person reads discrete price changes, and 20× faster than Binance's 2 s kline stream). MINIMAL = 1000 ms (1 Hz, still twice as fast as Binance's klines). DEGRADED = √(100·1000) ≈ 316, rounded to 6τ = **300 ms**. Each step is ≈3.3×.
+4. **Order within a tier.** Depth ≥ chart ≥ trades in update rate. Depth = chart/2, but never less than 1τ. Trades come from the latest-10 window: 10 trades at 20/s span 500 ms.
+5. **A tier is eligible if at most one update is in flight.** The pessimistic one-way delay L/2 must not exceed the tier's chart interval T, so **threshold = 2T**: FULL L < 200 ms, DEGRADED L < 600 ms.
+6. **Robust statistics.** L = median₅(RTT) + 4·MAD₅(RTT). The median ignores up to 2 outliers per window; the 4× is RFC 6298's k.
+7. **Asymmetric hysteresis.** Demote after 3 reports, promote after 5. Promote at 80% of the threshold (160 / 480 ms): a uniform 20% dead band.
+
+**Generation**, a pure function of the tick n = ⌊(t − 2026-01-01Z)/τ⌋ over a 60 s (1200-tick) cycle:
+
+| Regime | Ticks | Trades | Book changes | Shows |
+|---|---|---|---|---|
+| Normal | 0–599 (30 s) | 1 / tick = 20/s | every tick | steady flow |
+| Burst | 600–799 (10 s) | 3 / tick = **60/s**, ±$60 move | every tick | coalescing, big candles |
+| Quiet | 800–1199 (20 s) | 1 / 20 ticks = **1/s** | every 5th tick | no invented updates |
+| **Per cycle** | 1200 | **1220 = 20.33/s** | **880 = 14.67/s** | |
+
+**Delivery**, interval in ticks, and exact coalescing:
+
+| Tier | Depth / chart / trades | Trades per chart packet (normal / burst / quiet) | Book states per depth packet | Latest-10 trade coverage |
+|---|---|---|---|---|
+| FULL | 1τ / 2τ / 5τ = 50 / 100 / 250 ms | 2 / 6 / 1 | 1 (lossless) | 100%, each trade shown twice |
+| DEGRADED | 3τ / 6τ / 10τ = 150 / 300 / 500 ms | 6 / 18 / 1 | 3 | **100%, each exactly once** |
+| MINIMAL | 10τ / 20τ / 40τ = 500 / 1000 / 2000 ms | 20 / 60 / 1 | 10 | 25% (the REST history page has all) |
+
+**Bandwidth.** Measured per tab over one full 60 s cycle, three clients in parallel. The wire figure adds ≈78 B per frame (WS 2–4 + TLS 22 + TCP/IP 52):
+
+| Tier | Frames/s | Packets/s (depth · chart · trades) | Payload | Wire | Per hour | Model |
+|---|---|---|---|---|---|---|
+| FULL | 15.8 | 14.67 · 7.0 · 3.0 | 2.62 KB/s | **3.86 KB/s** | 13.9 MB | 3.9 |
+| DEGRADED | 8.2 | 5.78 · 2.57 · 1.67 | 1.13 KB/s | **1.77 KB/s** | 6.4 MB | 1.76 |
+| MINIMAL | 3.2 | 2.0 · 1.0 · 0.5 | 0.43 KB/s | **0.68 KB/s** | 2.4 MB | 0.66 |
+
+The measured packet rates equal the derivation exactly. For example, FULL chart = (30 s × 10 + 10 s × 10 + 20 s × 1)/60 = 7.0/s, and FULL depth = 880/60 = 14.67/s, so FULL is lossless. **Bandwidth depends on the tier, not on market activity**: packets are fixed-size and a burst only raises coalescing.
+
+**Server location.** RTT_min ≈ 2·d·r / (200 km/ms) + s, where fibre carries light at ≈ ⅔c, route inflation r ≈ 2 and platform overhead s ≈ 10 ms.
+
+| From India to | Distance | RTT (measured / estimated) | L | Tier |
+|---|---|---|---|---|
+| Singapore (this deployment) | 3,160 km | **77–125 ms, median 89 (measured)** | ≈ 108 | FULL |
+| Frankfurt | ~6,300 km | ≈ 130–185 ms | ≈ 170 | FULL/DEGRADED border |
+| US West | ~13,000 km | ≈ 230–295 ms | ≈ 280 | DEGRADED |
+| GEO satellite | — | ≈ 600 ms+ | ≥ 600 | MINIMAL |
+
+FULL needs RTT ≲ 180 ms, i.e. a server within ~8,500 km. Every terrestrial path fits inside DEGRADED; even the antipode is ≈ 410 ms. **MINIMAL means impairment** (congestion, lossy wireless, satellite), never geography alone.
+
+**Hysteresis behaviour** (`tier_test.go`, 1 probe/s):
+
+| Scenario | Result |
+|---|---|
+| Healthy India → Singapore | FULL after the 3-probe warmup, and stays FULL |
+| 1 or 2 spikes of 900 ms | **No change** |
+| Severe congestion (+400–600 ms) | DEGRADED on the 5th bad probe, MINIMAL within 10; after recovery, DEGRADED at +7 s and FULL at +12 s |
+| Flapping 3 s bad / 3 s good | ≤ 5 changes (promoting after 3 reports instead of 5 gives 21) |
+
+**Free-tier budget** (Render Hobby: 5 GB/month = 1.93 KB/s sustained): about **360 tab-hours at FULL**, 780 at DEGRADED and 2,080 at MINIMAL. That's roughly 0.5, 1.1 or 2.9 tabs open 24/7.
+
 ## 1. Architecture
 
 ```
- Generator ──(chan Event, every 50 ms)──► Market processor  (single writer goroutine)
-   seeded PRNG: trade + book                  ├─ candle.Series 1m ┐ ring of canonical states
-                                              ├─ candle.Series 5m ┘ keyed by chartSeq
+ Generator ──(chan Event, one per 50 ms tick)──► Market processor  (single writer goroutine)
+   pure function of tick n                    ├─ candle.Series 1m ┐ ring of canonical states
+   (no RNG, restart-safe)                     ├─ candle.Series 5m ┘ keyed by tick
                                               ├─ trades.Store (ring, 20k)
-                                              └─ orderbook.Engine ── ring of books keyed by depthSeq
-                                                         │  RWMutex reads
+                                              └─ orderbook.Engine ── ring of books keyed by tick
+                                                         │  RWMutex reads · publishes tick n
                     ┌────────────────────────────────────┼─────────────────────────────┐
                     ▼                                    ▼                             ▼
           REST (Gin) /api/*                  ws.Server = client manager         3 tier hubs
           history · snapshots · trades       conn lifecycle · tier state        FULL / DEGRADED / MINIMAL
-                                             machine · overrides ──moves──►     own tickers per stream
+                                             machine · overrides ──moves──►     flush on tick n when n % k == 0
                                                                                 one writer goroutine per conn
 ```
 
 **What happened vs. when it's delivered.** The market processor applies every generated event, whatever tier the clients are on. The WebSocket layer never computes candles and never owns the book. It reads canonical state and decides when each client receives it. A slower tier only changes how often updates are delivered. It never changes the final OHLCV values.
 
-**Tier hubs.** There is one WebSocket per browser. The client manager puts each connection into one of three hubs, and each hub has its own depth, chart and trade tickers. Clients flushed on the same tick converge on the same base sequence, so each packet is encoded once per `(stream, base)` and shared across those clients. A client that just moved to a new hub gets one catch-up delta computed from its own last sequence. After that it is in step with the rest of the hub.
+**Tier hubs.** There is one WebSocket per browser. The client manager puts each connection into one of three hubs. A hub has no timers of its own: after the market processes tick n it publishes n, and each stream fires when n is a multiple of its interval in ticks. Everything due on that tick goes into **one binary frame**; the header length field delimits the packets. Clients flushed on the same tick converge on the same base sequence, so each packet is encoded once per `(stream, base)` and shared across those clients. A client that just moved to a new hub gets one catch-up delta computed from its own last sequence. After that it is in step with the rest of the hub.
 
 **Backpressure.** Sends never block. If a client's buffer is full, that flush is skipped and the client's last-sent sequence doesn't advance, so the next flush sends one larger coalesced delta. Data is never silently lost.
 
@@ -59,12 +120,12 @@ E2E_API_URL=http://localhost:8080 npm test   # + live end-to-end test (backend m
 
 | Package | Responsibility |
 |---|---|
-| `generator` | Deterministic market: a random-walk mid price, trades at the touch, a 10×10 book on a contiguous tick grid, and seeded 1m history |
+| `generator` | The market as a pure function of the tick: regime schedule, closed-form trade ids and sequences, price path, book, candle aggregation |
 | `market` | Canonical state; single writer; consistent read views for REST and the hubs |
 | `candle` | Per-interval OHLCV, a ring of states by `chartSeq`, and coalesced `Transitions(base)` |
 | `orderbook` | Authoritative book, `depthSeq`, a state ring, and `Diff`/`ApplyDelta` |
 | `trades` | Bounded ring buffer: the latest 10 plus time-range queries |
-| `history` | History file format: generate, save, load, validate, rebase (`cmd/gendata` writes it) |
+| `history` | History file (sampled from the same function): generate, save, load, validate, and fill up to "now" |
 | `logging` | slog setup plus a dependency-free rotating file writer (daily and by size, with retention) |
 | `protocol` | Binary encode/decode (`encoding/binary`, little-endian) |
 | `client` | The tier state machine (hysteresis and missing reports); pure and unit-tested |
@@ -97,15 +158,16 @@ Zustand was chosen over Redux or Context because the store needs no reducers or 
 
 ## 3. Generated data
 
-- **Trades:** one per 50 ms (about 20/s). Each trade has a monotonically increasing `id` (`uint32`; also the chart sequence), `ts` (unix ms), `price`, `qty`, and `side`. Trades execute at the best bid or ask (occasionally one level through) and consume liquidity.
-- **Book:** 10 bids and 10 asks on a contiguous 0.50 tick grid around a random-walking mid price. The spread is 1 tick, occasionally 2. It is updated on about 85% of ticks, giving roughly 50 ms updates with occasional 100 ms gaps. The book always keeps `bestBid < bestAsk` and positive quantities, and the engine validates every update.
-- **History file:** `backend/data/history_1m.json` holds **3 days of 1m candles** (4,320 rows, about 250 KB), created by `go run ./cmd/gendata` with the same deterministic `generator.History` algorithm and seed.
-  - **Format:** a JSON header (symbol, scales, tick, seed, generatedAt), then one `[t, o, h, l, c, v]` row per line, as fixed-point integers.
-  - **At startup** the server loads and validates the file: symbol, scales and tick must match; candles must be contiguous and minute-aligned; OHLCV must be consistent. It then *rebases* the timestamps by whole minutes so the last candle ends at the current minute, and loads the candles into the candle cache.
-  - **Other intervals:** 5m candles are aggregated from the same 1m rows, so both intervals agree. The minutes already inside the current 5m window seed the active 5m candle.
-  - **Live continuity:** live trading continues from the file's last close, so there is no price jump between history and live data.
-  - **Missing file:** the same 3 days are generated in memory, with a warning. A file that exists but is invalid is a startup error, never silently replaced.
-- **Repeatability:** `RANDOM_SEED` (default 42) fixes the entire event sequence: every trade's price and quantity and every book shape. Only wall-clock timestamps differ between runs. `generator_test.go` checks this.
+Everything is a **pure function of the market tick** n = ⌊(t − 2026-01-01T00:00Z) / 50 ms⌋ (`internal/generator`). There is no random number generator and no hidden state, so the feed is exactly repeatable. A restarted process resumes the **same trade ids, sequences and prices**, and history and live data are one continuous series.
+
+- **Trades** (see the regime table in §0): trade j of tick n has id `TradesBefore(n) + j + 1`, computed in closed form (1220 per cycle), and `ts = tick start + j·⌊50/m⌋ ms`, so ids and timestamps are strictly increasing. Even ids buy at the ask; odd ids sell at the bid. Size cycles through 13 values from 0.010 to 0.058 BTC.
+- **Price path:** a sum of four sine waves, snapped to the 0.50 grid, with amplitude/period pairs of $250/6 h (multi-day trend), $120/97 min, $30/4 min (1m candle bodies) and $8/37 s. Each burst adds a ±$60 triangular move (the direction alternates by cycle) plus a ±$15 2 s wiggle. Both are zero at the window edges, so the path is continuous. The maximum slope is ≈ 2.3 $/s, which gives 1m ranges of about $20–90.
+- **Book:** 10 levels per side on a contiguous 0.50 grid with a one-tick spread. Each level pulses between its floor (0.20 + 0.10·i BTC) and floor + 0.30 with a 2 s period, phase-shifted per level. It changes every tick in normal and burst and every 5th tick in quiet.
+- **History file:** `backend/data/history_1m.json` holds **3 days of 1m candles** (4,320 rows, about 250 KB), sampled from the same function by `go run ./cmd/gendata`.
+  - **Format:** a JSON header (symbol, scales, tick, base price, generator `tick-v1`), then one `[t, o, h, l, c, v]` row per line.
+  - **At startup** the server validates the file: symbol, scales and market model must match; candles must be contiguous, minute-aligned and consistent. It keeps the file's candles inside the 3-day window and **computes any minutes the file doesn't cover** from the same function, up to and including the partial current minute. A file generated hours earlier therefore still yields exactly the candles a never-stopped server would have (`TestWindowEqualsFunction`).
+  - **The trade ring** is pre-filled with the last 20,000 ticks of trades, so `/api/trades` and the latest-10 panel are populated immediately.
+  - **Missing file:** everything is computed, with a warning. A file that exists but is invalid is a startup error.
 - **Precision:** prices are integers ×100 (0.01 USDT) and quantities are integers ×1e6 (0.000001 BTC), end to end. The browser keeps them as integers, which are safe up to 2⁵³, and formats them without floating-point math. Only the chart library receives floats, and only for drawing.
 
 ## 4. REST API
@@ -120,14 +182,14 @@ All values are fixed-point integers. `GET /api/meta` returns the scales.
 | `GET /api/candles?symbol=BTCUSDT&interval=1m\|5m&limit=1..5000` | `{seq, ltp, candles[], active}`. `seq` is the chart base for SYNC. |
 | `GET /api/orderbook/snapshot?symbol=BTCUSDT` | `{seq, ltp, ltq, tickSize, bids[10], asks[10]}` |
 | `GET /api/trades?symbol=BTCUSDT&from=ms&to=ms&limit=1..5000` | newest first, from the ring buffer, plus `retainedFrom` |
-| `GET /api/ws/status` | per-connection tier, SRTT, RTTVAR, E, override, sequences, packets sent |
+| `GET /api/ws/status` | per-connection tier, SRTT, RTTVAR, score L, override, sequences, packets, frames and bytes sent |
 | `POST /api/debug/clients/:id/tier` `{"tier":"AUTO\|FULL\|DEGRADED\|MINIMAL"}` | debug override |
 
 Invalid intervals, limits, ranges and symbols return `400`/`404` with `{"error": "..."}`. Empty history returns `candles: []` and `active: null`.
 
 ## 5. WebSocket protocol
 
-Market data is binary, little-endian, with a 15-byte header on every packet.
+Market data is binary, little-endian, with a 15-byte header on every packet. **One WebSocket frame carries every packet due on the same tick**: split it using each header's `length`.
 
 ```
 type u8 | length u16 (whole packet) | seq u32 | timestamp i64
@@ -135,8 +197,8 @@ type u8 | length u16 (whole packet) | seq u32 | timestamp i64
 
 | Type | Size | Header `seq` / `ts` | Payload |
 |---|---|---|---|
-| 1 `CHART_DELTA` | **63 B** | chartSeq / candle start | `baseSeq` (i64 slot), Δopen, Δhigh, Δlow, Δclose, Δvolume (i64) |
-| 2 `DEPTH_DELTA` | **115 B** | depthSeq / event time | `baseSeq` u32, `bestBid` i64, `bestAsk` i64, 10 bid Δqty i32, 10 ask Δqty i32 |
+| 1 `CHART_DELTA` | **63 B** | chart seq (tick) / candle start | `baseSeq` (i64 slot), Δopen, Δhigh, Δlow, Δclose, Δvolume (i64) |
+| 2 `DEPTH_DELTA` | **115 B** | depth seq (tick) / send time | `baseSeq` u32, `bestBid` i64, `bestAsk` i64, 10 bid Δqty i32, 10 ask Δqty i32 |
 | 3 `TRADE_UPDATE` | **143 B** | newest trade id / newest trade ts | LTP i64, then 10 × (Δprice i32, ±qty i32, Δtime i32) |
 | 4 `PING` | **15 B** | probe seq / client clock (µs) | none (client → server) |
 | 5 `PONG` | **15 B** | the same values echoed | none (server → client) |
@@ -151,18 +213,26 @@ JSON text frames carry control messages:
 
 | Direction | Message |
 |---|---|
-| server → client | `HELLO {connId, scales, tickSize, tiers}`, `TIER {tier, autoTier, override, reason, rates, effectiveLatencyMs, …}`, `SUBSCRIBED`, `SYNCED {stream, seq}`, `SYNC_FAILED`, `RESYNC {stream}`, `ERROR`, `DEBUG_ACK` |
-| client → server | `SUBSCRIBE {symbol, interval}`, `SYNC {stream, seq, interval?}`, `NET_REPORT {rttMs, srttMs, rttvarMs, samples}`, `SET_TIER_OVERRIDE {tier}`, `DEBUG {action: DROP_DEPTH\|DROP_CHART\|SIM_LATENCY, ms}` |
+| server → client | `HELLO {connId, scales, tickSize, tiers, clock}`, `TIER {tier, autoTier, override, reason, rates, effectiveLatencyMs (= L), medianMs, madMs, …}` (on change plus every 5 s), `SUBSCRIBED`, `SYNCED {stream, seq}`, `SYNC_FAILED`, `RESYNC {stream}`, `ERROR`, `DEBUG_ACK` |
+| client → server | `SUBSCRIBE {symbol, interval}`, `SYNC {stream, seq, interval?}`, `NET_REPORT {rttMs, srttMs, rttvarMs, samples}`, `SET_TIER_OVERRIDE {tier}`, `DEBUG {action: DROP_DEPTH\|DROP_CHART\|SIM_LATENCY\|SPIKE, ms}` |
 
 ## 6. Sequences and synchronisation (chart and order book)
 
-There is **one canonical sequence per stream**, never one per tier:
+There is **one clock for every stream: the market tick.** A stream's sequence is the tick at which its canonical state last changed:
 
-- `chartSeq` is the trade id. Every trade is one chart state transition, for both 1m and 5m.
-- `depthSeq` increments with every canonical book update.
-- Trades use their own trade ids.
+- chart seq = the tick of the last trade applied (the same value for 1m and 5m);
+- depth seq = the tick of the last book change;
+- trades keep their own ids (`TRADE_UPDATE`'s header seq is the newest id).
 
-A tier only decides *which* canonical states are delivered and when. A FULL client might receive `0→1, 1→2, 2→3`, while a MINIMAL client receives `0→10` as one net delta.
+A tier only decides *which ticks* are sampled. With the market in its normal regime:
+
+```
+FULL     chart: base 100 → 102 → 104 → 106 …     (every 2 ticks)
+DEGRADED chart: base 100 → 106 → 112 → 118 …     (every 6 ticks)
+MINIMAL  chart: base 100 → 120 → 140 → 160 …     (every 20 ticks)
+```
+
+When nothing changed (the quiet regime between trades) no packet is sent, so the next base is the last *delivered* tick, not seq − k.
 
 **Invariant:** a delta is applied only if `packet.baseSeq == local seq`.
 
@@ -188,64 +258,43 @@ The deltas are additive and may be coalesced, so a packet can never be partially
 - If a slow tier's flush crosses a candle boundary, the server sends one transition that finalises the old candle, then one for the new candle.
 - History is sorted and de-duplicated by timestamp.
 
-**Server retention.** Ring buffers hold 4096 states per stream (about 3.4 min at 20/s). If a client's base has aged out, the server sends `RESYNC` or `SYNC_FAILED` and the client re-snapshots.
+**Server retention.** Ring buffers hold 4096 ticks per stream (about 3.4 min). If a client's base has aged out, the server sends `RESYNC` or `SYNC_FAILED` and the client re-snapshots.
 
 ## 7. Latency and jitter measurement
 
-The client measures on its own clock, reports the results, and the server decides the tier.
+The client measures on its own clock, reports each sample, and the server decides the tier.
 
-- Every **1 s** the app sends a binary `PING(probeSeq, performance.now() µs)`. The server echoes it immediately as a `PONG`.
+- **Probes:** the app sends a binary `PING(probeSeq, performance.now() µs)` and the server echoes it immediately as a `PONG`. It starts with **3 fast-start probes 200 ms apart**, which fill the server's warmup window so the first tier is known in about 0.6 s, then sends 1 probe per second.
 - `RTT = now − echoedTimestamp`. Both timestamps come from the browser's monotonic clock, so no clock synchronisation is needed. Invalid or future probes are ignored.
-- Smoothing follows RFC 6298:
-  - First sample: `SRTT = RTT`, `RTTVAR = RTT/2`.
-  - After that: `RTTVAR = ¾·RTTVAR + ¼·|SRTT − RTT|` and `SRTT = ⅞·SRTT + ⅛·RTT`.
-- **Jitter is RTTVAR**, the smoothed mean deviation of RTT.
-- After each sample the app sends `NET_REPORT {rttMs, srttMs, rttvarMs}`.
-- The server scores the connection as **`E = SRTT + 4·RTTVAR`**. This is the RFC 6298 retransmission-timeout form: a pessimistic latency bound that penalises jitter as well as delay.
-- **Hidden tabs.** Browsers throttle timers in hidden tabs, which would measure the throttling rather than the network. While the tab is hidden, samples are skipped and not reported, and the estimator resets when the tab becomes visible again.
+- **Latency and jitter** as the app reports them (RFC 6298): `SRTT = ⅞·SRTT + ⅛·RTT` and **jitter = RTTVAR** = `¾·RTTVAR + ¼·|SRTT − RTT|`. Each probe sends `NET_REPORT {rttMs, srttMs, rttvarMs}`.
+- **The server's decision signal** uses the raw `rttMs` samples: **L = median₅ + 4·MAD₅**. EWMA smoothing is fine for display, but as a decision signal it lets one spike inflate 4·RTTVAR for several probes (a single 900 ms spike demoted FULL→MINIMAL) and recovers slowly (28–35 s). The median ignores up to two outliers per window.
+- **Hidden tabs.** Browsers throttle timers in hidden tabs, which would measure the throttling rather than the network. While hidden, samples are skipped and not reported, and the estimator resets when the tab becomes visible again.
 
 ## 8. Tiers, thresholds and hysteresis
 
-| Tier | E range | Depth | Chart | Trades |
+| Tier | L range (L = median₅ + 4·MAD₅) | Depth | Chart | Trades |
 |---|---|---|---|---|
-| **FULL** | E < 100 ms | 50 ms (20/s) | 100 ms (10/s) | 250 ms (4/s) |
-| **DEGRADED** | 100 ≤ E < 250 ms | 100 ms (10/s) | 250 ms (4/s) | 500 ms (2/s) |
-| **MINIMAL** | E ≥ 250 ms | 250 ms (4/s) | 1000 ms (1/s) | 2000 ms (0.5/s) |
+| **FULL** | L < 200 ms | 50 ms (1τ, lossless) | 100 ms (2τ) | 250 ms (5τ) |
+| **DEGRADED** | 200 ≤ L < 600 ms | 150 ms (3τ) | 300 ms (6τ) | 500 ms (10τ) |
+| **MINIMAL** | L ≥ 600 ms | 500 ms (10τ) | 1000 ms (20τ) | 2000 ms (40τ) |
 
-Why these values:
-
-- **FULL matches generation.** Depth is flushed every 50 ms, the same rate the book is generated.
-- **100 ms boundary.** Below it, frequent updates still arrive before the next one is due.
-- **250 ms boundary.** At or above it, a 10/s chart feed would queue on a link that can't round-trip in time.
-- **Rate ordering.** Each tier keeps depth > chart > trades. The book is what traders act on, the chart moves perceptibly at 1–10 Hz, and trades are a list of the latest 10.
-- **Configurable.** Every rate can be changed through environment variables (see [Configuration](#configuration)).
+The derivation of every number is in [§0](#0-design-in-numbers-every-constant-and-where-it-comes-from). In short: the chart intervals are geometric (100 → 300 → 1000); each threshold = 2 × the tier's chart interval (at most one update in flight); depth = chart/2; trades follow the latest-10 window.
 
 **Hysteresis** (`internal/client/tier.go`). Transitions move one step at a time:
 
 | Transition | Condition |
 |---|---|
-| FULL → DEGRADED | E ≥ 100 ms for **3** consecutive reports |
-| DEGRADED → MINIMAL | E ≥ 250 ms for **3** consecutive reports |
-| MINIMAL → DEGRADED | E < 200 ms for **5** consecutive reports |
-| DEGRADED → FULL | E < 80 ms for **5** consecutive reports |
+| FULL → DEGRADED | L ≥ 200 ms for **3** consecutive reports |
+| DEGRADED → MINIMAL | L ≥ 600 ms for **3** consecutive reports |
+| MINIMAL → DEGRADED | L < 480 ms for **5** consecutive reports |
+| DEGRADED → FULL | L < 160 ms for **5** consecutive reports |
 
-- The promotion boundaries (80 and 200) sit inside the demotion boundaries (100 and 250), so a score hovering at a boundary can't cause flapping.
-- Promotion is slower (5 reports) than demotion (3), because recovering too early is worse than degrading slightly late.
-- A counter resets as soon as its condition breaks.
-- **Warmup.** A connection starts in DEGRADED, the safe middle, and is classified directly after 5 reports.
-
-**Missing reports.** Silence is treated as a bad connection:
-- More than 3 s without a report: capped at DEGRADED.
-- More than 6 s without a report: MINIMAL.
-- When reports resume, the connection is promoted through normal hysteresis.
-
-**Connection drops.** The server's reader exits and the connection is removed from its hub, its timers and goroutines stop, and its state is released. A WebSocket control ping every 15 s, with a 45 s read deadline, detects dead TCP connections.
-
-**Tier changes never create a new sequence space.** The client's `lastSeq` values carry over, and the first packet in the new hub is a catch-up delta from that sequence.
-
-**Candle correctness across tiers.** `candle_test.go` applies coalesced transitions at cadences of 1, 2, 5, 20, 400 and 1500 trades per flush and checks that every closed and active candle equals the canonical one. The end-to-end test checks the same thing on the live system at a forced MINIMAL tier.
-
-**Display.** The UI shows the tier (automatic or forced), the reason for the last change, the target rate per stream, the measured received/s, and RTT, SRTT, RTTVAR and E.
+- **Warmup:** a connection starts in DEGRADED and is classified directly after 3 probes.
+- **Missing reports:** silence counts as bad samples. After 3 s (3 missed probes, the demotion count) the tier is capped at DEGRADED; after 6 s it drops to MINIMAL.
+- **Connection drops:** the reader exits, and the connection leaves its hub with its state released. A WebSocket control ping every 15 s with a 45 s read deadline detects dead TCP connections.
+- **Tier changes never create a new sequence space.** The first packet in the new hub is a catch-up delta from the client's own last tick.
+- **Candle correctness across tiers:** `candle_test.go` (tick-boundary flushes at any cadence reproduce the canonical candles exactly), `TestHubBatchesAndCoalescesByTick` (a DEGRADED frame carries chart and depth `n → n+6` plus the trades in one frame, and nothing is sent when nothing changed), and the e2e test at forced MINIMAL.
+- **Display:** the tier (automatic or forced) and reason, target vs. received rates per stream, RTT/SRTT/RTTVAR, the server's median₅ · MAD₅ and L, the threshold bands, and the current market regime with a countdown.
 
 ## 9. Reconnect, browser lifecycle and stale state
 
@@ -265,7 +314,8 @@ These are for demonstration only. They are in the **Debug controls** panel and a
 | Control | Effect |
 |---|---|
 | Force tier: AUTO / FULL / DEGRADED / MINIMAL | Sends `SET_TIER_OVERRIDE`. The effective tier becomes the override. The automatic state machine keeps running, the UI shows what it *would* choose, and AUTO restores it. Also available as `POST /api/debug/clients/:id/tier`. |
-| Simulated latency +60/+150/+400 ms | The server delays this connection's PONGs, so the **automatic** tiering can be demonstrated without a bad network. |
+| Simulated latency: off / **+300 ms → DEGRADED** / **+700 ms → MINIMAL** | The server delays this connection's PONGs so the **automatic** tiering reacts. The presets aim L at the middle of each band (L ≈ 300 + base, ≈ 700 + base). |
+| **Spike (tier should hold)** | Delays exactly one PONG by 900 ms. The median ignores it, which shows the hysteresis working. |
 | Drop depth / chart packet | The server advances its view of the client without sending one packet. The client detects the gap, re-snapshots and resumes, and the event log shows each step. |
 | Kill socket | Closes the socket, then auto-reconnects and resyncs. |
 | Go offline / Resume | Stays disconnected, to show the stale state, until resumed. |
@@ -275,16 +325,17 @@ These are for demonstration only. They are in the **Debug controls** panel and a
 All backend settings are environment variables with defaults:
 
 ```
-SERVER_PORT=8080 (or PORT)   WS_PATH=/ws        SYMBOL=BTCUSDT     RANDOM_SEED=42
+SERVER_PORT=8080 (or PORT)   WS_PATH=/ws        SYMBOL=BTCUSDT
 ALLOWED_ORIGINS=*            LOG_LEVEL=info|debug
 LOG_OUTPUT=file|stdout|both  LOG_DIR=logs  LOG_FORMAT=json|text  LOG_MAX_MB=50  LOG_MAX_DAYS=7
-TRADE_INTERVAL_MS=50         DEPTH_SKIP_PCT=15  START_PRICE_CENTS=6500000  TICK_SIZE_CENTS=50
+BASE_PRICE_CENTS=6500000     TICK_SIZE_CENTS=50   (the market tick itself is fixed at 50 ms)
 HISTORY_FILE=data/history_1m.json   HISTORY_CANDLES=4320 (cache capacity per interval)
 TRADE_BUFFER=20000           STATE_RING=4096
 FULL_DEPTH_MS=50      FULL_CHART_MS=100      FULL_TRADE_MS=250
-DEGRADED_DEPTH_MS=100 DEGRADED_CHART_MS=250  DEGRADED_TRADE_MS=500
-MINIMAL_DEPTH_MS=250  MINIMAL_CHART_MS=1000  MINIMAL_TRADE_MS=2000
-WARMUP_SAMPLES=5      REPORT_DEGRADE_MS=3000 REPORT_MINIMAL_MS=6000
+DEGRADED_DEPTH_MS=150 DEGRADED_CHART_MS=300  DEGRADED_TRADE_MS=500
+MINIMAL_DEPTH_MS=500  MINIMAL_CHART_MS=1000  MINIMAL_TRADE_MS=2000
+WARMUP_SAMPLES=3      REPORT_DEGRADE_MS=3000 REPORT_MINIMAL_MS=6000
+(delivery intervals are rounded down to whole 50 ms ticks)
 ```
 
 The frontend reads `NEXT_PUBLIC_API_URL` and, optionally, `NEXT_PUBLIC_WS_URL`. Both are inlined at build time; see `frontend/.env.example`.
@@ -296,7 +347,7 @@ By default the backend writes **log files instead of printing to the terminal**.
 - **Location:** `LOG_DIR` (default `logs/`, relative to where the server runs). Files are named `backend-YYYY-MM-DD.log`.
 - **Format:** JSON lines by default (`LOG_FORMAT=text` gives key=value lines).
 - **Rotation:** a new file starts at local midnight. A file over `LOG_MAX_MB` (default 50) is renamed to `backend-YYYY-MM-DD.N.log` and a fresh file is opened. Files older than `LOG_MAX_DAYS` (default 7) are deleted.
-- **Contents:** startup, history loading, client connect/disconnect, tier changes with SRTT, RTTVAR and E, overrides, debug actions, sequence resyncs, generator rates every 30 s, one access-log line per REST request (method, path, status, compressed bytes, duration), and panics. `/api/health` is logged only at `LOG_LEVEL=debug`, so platform health checks don't flood the file.
+- **Contents:** startup, history loading, client connect/disconnect, tier changes with SRTT, RTTVAR and the score L, overrides, debug actions, sequence resyncs, generator rates every 30 s, one access-log line per REST request (method, path, status, compressed bytes, duration), and panics. `/api/health` is logged only at `LOG_LEVEL=debug`, so platform health checks don't flood the file.
 - **Output modes:** `LOG_OUTPUT=file` (local default), `stdout` (the Docker default, so a platform's log viewer captures it) or `both`.
 
 ```bash
@@ -307,15 +358,7 @@ jq -r 'select(.msg=="http request") | [.time,.path,.status,.bytes] | @tsv' backe
 
 ## Bandwidth
 
-These figures were measured with a real client against the running backend for 20 s per tier. The payload column is WebSocket message bytes. The wire column adds roughly 80 B per message for WebSocket, TLS and TCP/IP overhead.
-
-| Tier | Server → client msgs/s | Payload | ≈ On the wire | Per hour | Client → server |
-|---|---|---|---|---|---|
-| FULL | 29 (depth 13.4, chart 10, trades 4, pong + TIER 2) | 3.0 KB/s | 5.3 KB/s | ≈ 19 MB | ≈ 0.12 KB/s |
-| DEGRADED | 17 | 1.9 KB/s | 3.3 KB/s | ≈ 12 MB | ≈ 0.12 KB/s |
-| MINIMAL | 7 | 0.84 KB/s | 1.4 KB/s | ≈ 5 MB | ≈ 0.12 KB/s |
-
-Depth runs at 13.4/s rather than 20/s at FULL because the server never sends a packet when the book hasn't changed.
+See the measured per-tier table in [§0](#0-design-in-numbers-every-constant-and-where-it-comes-from): FULL 3.86, DEGRADED 1.77 and MINIMAL 0.68 KB/s on the wire, averaged over one 60 s market cycle. Before the redesign (independent timers, TIER every second, one packet per frame) the same tiers used 5.3, 3.3 and 1.4 KB/s. Uplink is ≈ 0.11 KB/s of payload per tab (PING plus NET_REPORT).
 
 **One-time transfers** (REST responses are gzipped):
 
@@ -326,7 +369,7 @@ Depth runs at 13.4/s rather than 20/s at FULL because the server never sends a p
 | Book snapshot | 0.7 KB | 0.26 KB |
 | Frontend JS + CSS, first visit (static host, cached afterwards) | 1.1 MB | ≈ 260 KB |
 
-A first visit costs about 0.4 MB. Each reconnect or interval switch costs about 0.1 MB. After that the stream costs 5–19 MB per hour per open tab, depending on tier. The backend is single-process with low CPU and memory use, so bandwidth is the constraint on free hosting, not compute.
+A first visit costs about 0.4 MB. Each reconnect or interval switch costs about 0.1 MB. After that the stream costs 2.4–13.9 MB per hour per open tab, depending on tier. The backend is single-process with low CPU and memory use, so bandwidth is the constraint on free hosting, not compute.
 
 ## Hosting (free)
 
@@ -338,11 +381,11 @@ The frontend is fully static; every route is prerendered. The backend must be **
 | Backend bandwidth | **5 GB/month** (Render Hobby workspace) | **10 TB/month** |
 | Backend compute | 512 MB, 0.1 CPU, single instance | Ampere A1: up to 2 OCPU / 12 GB |
 | Always on | No: sleeps after **15 min without inbound HTTP/WebSocket traffic**; about 1 min cold start | Yes |
-| Behaves like local | Yes while awake. The backend restarts when it wakes: history reloads from the file, live sequences restart, and clients reconnect and resync automatically. | Yes, identical |
+| Behaves like local | Yes while awake. Waking restarts the process, but the market is a function of the clock, so prices, trade ids and sequences resume exactly where they would have been; clients reconnect and resync automatically. | Yes, identical |
 | Logs | Render Logs tab (stdout) | Rotating files in `deploy/oracle/logs/`, plus `docker compose logs` |
 | Frontend (Vercel Hobby) | 100 GB/month transfer, non-commercial use only | same |
 
-**What 5 GB on Render means:** about 260 hours of one tab at FULL (roughly 8 hours a day) or about 1,000 hours at MINIMAL. That's enough for a demo or interview, but not for leaving tabs open all day. By default the service is **suspended** when the limit is reached; if a payment method is on file, overage is billed at $0.15/GB. For always-on use, or more than a couple of viewers, use the Oracle VM.
+**What 5 GB on Render means:** about 360 hours of one tab at FULL (roughly 12 hours a day) or about 2,080 hours at MINIMAL. That's enough for a demo or interview, but not for leaving tabs open all day. By default the service is **suspended** when the limit is reached; if a payment method is on file, overage is billed at $0.15/GB. For always-on use, or more than a couple of viewers, use the Oracle VM.
 
 ### Option A — Vercel + Render (quickest)
 
@@ -371,7 +414,7 @@ The frontend is fully static; every route is prerendered. The backend must be **
 4. **Frontend** on Vercel as in Option A, with `NEXT_PUBLIC_API_URL=https://<public-ip-with-dashes>.sslip.io`.
 5. Logs are in `deploy/oracle/logs/backend-YYYY-MM-DD.log`. Updating to a new version is `git pull && sudo -E docker compose up -d --build`.
 
-**Latency and tiers when hosted.** Tiers now reflect the real internet round trip. From India, a Singapore or Mumbai region typically gives an RTT of about 30–80 ms, so the connection should sit at FULL or near the FULL/DEGRADED boundary. A US region usually gives 200 ms or more, which means DEGRADED or MINIMAL. Pick the region closest to your viewers. The debug controls work the same when hosted.
+**Latency and tiers when hosted.** Tiers now reflect the real internet round trip. From India to Singapore we measured 77–125 ms (L ≈ 108), which is FULL. The location table in §0 derives the ceiling for other regions: Frankfurt is borderline and the US is DEGRADED. Pick the region closest to your viewers. The debug controls work the same when hosted.
 
 **CI.** `.github/workflows/ci.yml` runs gofmt, vet and `go test -race`, builds the Docker image, runs the frontend typecheck, lint, unit tests and build, and runs the live end-to-end test.
 
@@ -379,33 +422,32 @@ The frontend is fully static; every route is prerendered. The backend must be **
 
 | Test | What it proves |
 |---|---|
-| `backend/internal/client/tier_test.go` | Hysteresis: warmup; a single bad sample doesn't demote; 3 bad samples demote, 3 more reach MINIMAL; 1 good sample doesn't promote; 5 good samples promote; no flapping inside the band; the missing-report policy |
-| `backend/internal/candle/candle_test.go` | OHLCV correctness; rollover opens a fresh candle; **coalesced delivery at any cadence reproduces the canonical candles exactly**; base mismatch and eviction |
-| `backend/internal/orderbook/orderbook_test.go` | snapshot 100 + deltas 101..103 give the exact book; coalesced deltas across price shifts; gap 100→101→103 detected and recovered |
-| `backend/internal/ws/ws_test.go` | Real WebSocket: SYNC, then deltas equal the canonical book; injected gap detected; recovery; override and AUTO; malformed input doesn't kill the connection |
-| `backend/internal/history/history_test.go` | 3-day generation is deterministic; save/load round trip; rebase ends at the current minute without changing prices; malformed files rejected (symbol, tick, scale, gaps, alignment, OHLC, volume) |
-| `backend/internal/logging/logging_test.go` | Log files rotate by size (.1, .2, …) and at midnight; old files are pruned while unrelated files are kept; writing after close fails |
-| `backend/internal/protocol`, `generator` | Exact packet sizes, round trips, malformed packets; determinism by seed; book invariants |
-| `frontend/src/lib/__tests__/depthSync.test.ts` | Client sync machine: in-order deltas, coalesced deltas, gap and re-snapshot, **buffering during an in-flight snapshot** (fast path and SYNC fallback), late snapshot ignored, duplicates, disconnect |
-| `frontend/src/lib/__tests__/chart.test.ts`, `protocol.test.ts` | Candle rollover from zero, older candle rejected, dedupe, empty history; decoder, malformed packets, the RFC 6298 estimator, fixed-point formatting |
-| `frontend/src/lib/__tests__/feed.e2e.test.ts` (opt-in) | The real `FeedClient` against a running backend: local book and candles **byte-identical to REST at the same seq** at FULL and forced MINIMAL, after a gap, after an interval switch and after a reconnect; simulated latency demotes and promotes automatically |
+| `backend/internal/generator/generator_test.go` | Regime schedule; per-cycle totals (1220 trades, 880 book states); **closed forms equal plain counting** over 5 cycles; the event at tick n is a pure function (restart-safe); ids and timestamps increasing; trades at the touch; price continuous across regimes |
+| `backend/internal/client/tier_test.go` | Score (median/MAD); healthy India→Singapore reaches FULL and stays; **1 or 2 spikes cause no change**; severe congestion demotes and recovers on schedule; moderate congestion leaves FULL; flapping ≤ 5 changes; dead band holds; location profiles (20 ms → GEO satellite); missing-report policy; thresholds = 2 × chart interval |
+| `backend/internal/ws/ws_test.go` | **`TestHubBatchesAndCoalescesByTick`** (the sequence model: DEGRADED frame = depth + chart `n→n+6` + trades, nothing sent when nothing changed); real WebSocket SYNC with deltas matching the market function; injected gap and recovery; override and AUTO; malformed input |
+| `backend/internal/candle/candle_test.go` | OHLCV; rollover; coalesced delivery at any tick cadence (3 trades per tick) reproduces the canonical candles; base mismatch; eviction |
+| `backend/internal/orderbook/orderbook_test.go` | Snapshot + deltas give the exact book; coalescing at 1/3/10 ticks across price shifts and the quiet regime; gap detection; out-of-order book rejected |
+| `backend/internal/history/history_test.go` | Save/load round trip; **an old file plus computed fill equals the pure function**, including the partial current minute; malformed files rejected |
+| `backend/internal/protocol`, `logging` | Packet sizes, round trips, malformed input, frame splitting; log rotation and retention |
+| `frontend/src/lib/__tests__/*.test.ts` | Sync state machine (buffering during snapshot, fast path, SYNC fallback, gaps, late responses); chart rollover; decoder and **batched-frame splitting**; RFC 6298 estimator; fixed-point formatting |
+| `frontend/src/lib/__tests__/feed.e2e.test.ts` (opt-in) | The real `FeedClient` against a running backend: book and candles byte-identical to REST at the same seq at FULL and forced MINIMAL, after a gap, an interval switch and a reconnect; **a spike does not change the tier**; +700 ms demotes to MINIMAL and removing it promotes back to FULL |
 
 ## Packages
 
-- **Backend:** `github.com/gin-gonic/gin` (REST) and `github.com/gorilla/websocket`. Everything else is the Go standard library (`log/slog`, `encoding/binary`, `math/rand`).
+- **Backend:** `github.com/gin-gonic/gin` (REST) and `github.com/gorilla/websocket`. Everything else is the Go standard library (`log/slog`, `encoding/binary`, `math`).
 - **Frontend:** `next`, `react`, `zustand` (state), `lightweight-charts` (rendering only; the app supplies all data), `tailwindcss` (styling), `vitest` (tests).
 
 ## Known limitations
 
-- **Free Render sleeps.** After 15 minutes without traffic the service stops, and waking it takes about 1 minute and restarts the process. Clients recover automatically (reconnect, re-snapshot, and trade-id dedupe is reset per connection), but live sequences restart.
-- **Single process, in memory.** Restarting the backend resets live state. The 3-day candle history reloads from the file, but live trades and sequences restart.
-- **The history file has candles, not trades.** Three days of individual trades would be about 5 million rows, so `/api/trades` covers only trades generated since startup.
-- **History is rebased at startup.** Timestamps shift so the dataset always reads as "the last 3 days"; prices and volumes are unchanged.
+- **Free Render sleeps.** After 15 minutes without traffic the service stops, and waking takes about 1 minute. Because the market is a function of the clock, the restarted process continues the same series; clients reconnect and resync.
+- **Single process, in memory.** Only one backend instance may run, because hubs sample that process's canonical state.
+- **Synthetic, periodic market.** The price is a sum of sines and the regimes repeat every 60 s. That's ideal for a repeatable demonstration, but visibly regular.
+- **Trade history is bounded** to the last 20,000 ticks of trades (pre-filled at startup). Older trades can be recomputed from the function but aren't served.
 - **Trade history is bounded** to the most recent 20,000 trades (about 16 min). Older ranges return what's retained, and `retainedFrom` tells the client where that starts.
 - **The live trade list is a window, not a log.** At MINIMAL, trades between flushes appear only in REST history.
 - **Short retention for SYNC.** A client whose base is older than the 4096-state ring buffer (about 3.4 min of stalled delivery) gets `RESYNC` and re-snapshots.
 - **Book model.** The book is a contiguous tick grid with 10 levels per side, as the packet format requires. Real books can have empty price levels.
 - **RTT includes browser main-thread delay.** If the page is busy, measured latency rises. That is arguably correct for an application-level delivery tier.
-- **Timestamps come from the backend clock.** Only the event *sequence* is reproducible across runs.
+- **Timestamps come from the backend clock.** Timestamps, ids and prices are all derived from it, so a skewed server clock shifts the whole market.
 - **Race detector.** `go test -race` needs cgo. It runs in CI on Linux; it could not run on the Windows development machine, which has no C compiler.
 - **No watchlist.** There is only one symbol, so the bonus watchlist reordering isn't implemented.
