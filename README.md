@@ -146,7 +146,6 @@ cd frontend && npm install && npm run dev   # http://localhost:3000
 
 cd backend  && go test ./...
 cd frontend && npm test                                       # unit tests
-cd frontend && E2E_API_URL=http://localhost:8080 npm test    # + end-to-end (backend running)
 ```
 
 - **Frontend config:** `NEXT_PUBLIC_API_URL` (the WebSocket URL is derived from it).
@@ -159,6 +158,4 @@ cd frontend && E2E_API_URL=http://localhost:8080 npm test    # + end-to-end (bac
 - **Trades are a window, not a log.** Depth and chart are eventually consistent: a slower tier still reaches the exact same state, because missed states are merged into the next delta. Trades aren't merged: each tier just receives the latest 10 at its rate. At MINIMAL, trades between flushes are visible only on the REST history page.
 - **Synthetic, periodic market.** A sum of sines with a 60 s regime cycle: repeatable, but visibly regular.
 - **Single in-memory instance.** Only one backend process can run, and trade history is limited to recent trades.
-- **Contiguous book.** Always 10 levels per side on a one-tick grid; real books can have gaps.
-- **Race detector** (`go test -race`) runs in CI on Linux only.
-- **No watchlist.** There's only one symbol.
+- **Backend on Renderer free plan**- The backend is hosted on Render's free tier, which causes it to spin down after 15 minutes of inactivity. As a result, initial requests experience a noticeable delay while the server warms up.
