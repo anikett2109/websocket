@@ -72,8 +72,8 @@ export function TierPanel() {
         </p>
 
         <div className="grid grid-cols-2 gap-x-4 gap-y-1 border-t border-line pt-3 text-xs">
-          <Metric label="Last RTT" v={`${f1(net.rttMs)} ms`} />
-          <Metric label="Samples" v={`${net.samples}`} />
+          <Metric label="Last RTT (network)" v={`${f1(net.rttMs)} ms`} />
+          <Metric label="Server hold" v={`${f1(net.holdMs)} ms`} />
           <Metric label="Latency (median₅)" v={`${f1(net.latencyMs)} ms`} />
           <Metric label="Jitter (MAD₅)" v={`${f1(net.jitterMs)} ms`} />
         </div>

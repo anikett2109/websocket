@@ -159,7 +159,7 @@ func (c *Client) handleBinary(b []byte) {
 		c.sendError("malformed or unexpected binary packet")
 		return
 	}
-	pong := frame{data: protocol.EncodeProbe(protocol.TypePong, h.Seq, h.TS)}
+	received := time.Now()
 	c.mu.Lock()
 	delay := c.simLatency
 	if c.spikeNext {
@@ -167,11 +167,18 @@ func (c *Client) handleBinary(b []byte) {
 		c.spikeNext = false
 	}
 	c.mu.Unlock()
+	// hold = time spent in this process beyond the intended delay. On a
+	// 0.1-CPU host the process is paused when its CPU quota runs out, so
+	// timers fire late; that lateness is the server's, not the client's network.
+	send := func() {
+		hold := max(0, time.Since(received)-delay)
+		c.enqueue(frame{data: protocol.EncodePong(h.Seq, h.TS, uint32(min(hold.Microseconds(), 1<<32-1)))})
+	}
 	if delay > 0 {
-		time.AfterFunc(delay, func() { c.enqueue(pong) })
+		afterFunc(delay, send)
 		return
 	}
-	c.enqueue(pong)
+	send()
 }
 
 type controlMsg struct {
@@ -274,6 +281,9 @@ func (c *Client) sync(m controlMsg) {
 }
 
 func validMs(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v < 60_000 }
+
+// afterFunc schedules delayed PONGs (replaceable in tests to model a late timer).
+var afterFunc = time.AfterFunc
 
 // SpikeDelay is the debug "Spike" action: one PONG delayed by 900 ms, a single
 // outlier the robust median must ignore (the tier should not change).

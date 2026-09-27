@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -276,5 +277,37 @@ func TestHubBatchesAndCoalescesByTick(t *testing.T) {
 	case f := <-c.send:
 		t.Fatalf("unexpected frame of %d bytes with no market change", len(f.data))
 	default:
+	}
+}
+
+// TestPongReportsServerHold models a CPU-starved host: the timer for a
+// simulated-latency PONG fires 80 ms late. The PONG must carry that 80 ms as
+// server hold (so the client can subtract it) and exclude the intended delay.
+func TestPongReportsServerHold(t *testing.T) {
+	orig := afterFunc
+	afterFunc = func(d time.Duration, f func()) *time.Timer { return time.AfterFunc(d+80*time.Millisecond, f) }
+	t.Cleanup(func() { afterFunc = orig })
+
+	h := setup(t)
+	h.waitText("HELLO")
+	h.send(map[string]any{"type": "DEBUG", "action": "SIM_LATENCY", "ms": 100})
+	h.waitText("DEBUG_ACK")
+	_ = h.conn.WriteMessage(websocket.BinaryMessage, protocol.EncodeProbe(protocol.TypePing, 7, 1))
+	for {
+		b, _ := h.next()
+		if b == nil {
+			continue
+		}
+		parts, _ := protocol.SplitFrame(b)
+		for _, p := range parts {
+			if p[0] != protocol.TypePong {
+				continue
+			}
+			hold := time.Duration(binary.LittleEndian.Uint32(p[15:])) * time.Microsecond
+			if hold < 75*time.Millisecond || hold > 150*time.Millisecond {
+				t.Fatalf("hold %v, want ≈80ms (the lateness only, not the 100ms simulated delay)", hold)
+			}
+			return
+		}
 	}
 }

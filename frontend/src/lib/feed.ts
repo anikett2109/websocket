@@ -258,7 +258,7 @@ export class FeedClient {
         this.rates.trades.hit(now);
         return this.onTrades(p);
       case "pong":
-        return this.onPong(p.seq, p.ts);
+        return this.onPong(p.seq, p.ts, p.holdUs);
     }
   }
 
@@ -328,8 +328,12 @@ export class FeedClient {
     this.send(encodePing(++this.probeSeq, performance.now() * 1000));
   }
 
-  private onPong(seq: number, tsMicros: number) {
-    const rtt = (performance.now() * 1000 - tsMicros) / 1000;
+  // RTT for the health report is the network round trip: the raw RTT minus
+  // the time the server held the probe (CPU scheduling / late timers on a
+  // small host), as NTP subtracts server processing time.
+  private onPong(seq: number, tsMicros: number, holdUs: number) {
+    const holdMs = holdUs / 1000;
+    const rtt = Math.max(0, (performance.now() * 1000 - tsMicros) / 1000 - holdMs);
     if (seq > this.probeSeq || rtt < 0 || rtt > 60_000) {
       this.log("invalid pong ignored", "warn");
       return;
@@ -337,8 +341,8 @@ export class FeedClient {
     if (document.hidden) return; // throttled timers would inflate RTT
     this.meter.add(rtt);
     const { latency, jitter, score, samples } = this.meter;
-    this.send({ type: "NET_REPORT", latencyMs: latency, jitterMs: jitter, rttMs: rtt, samples });
-    this.queue({ net: { rttMs: rtt, latencyMs: latency, jitterMs: jitter, scoreMs: score, samples } });
+    this.send({ type: "NET_REPORT", latencyMs: latency, jitterMs: jitter, rttMs: rtt, serverHoldMs: holdMs, samples });
+    this.queue({ net: { rttMs: rtt, holdMs, latencyMs: latency, jitterMs: jitter, scoreMs: score, samples } });
   }
 
   private publishRates() {

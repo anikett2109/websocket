@@ -384,7 +384,7 @@
       <tr><td><code>DEPTH_DELTA</code></td><td>115 B</td><td>Check <code>baseSeq</code>. Rebuild the 10 levels from <code>bestBid/bestAsk ∓ i·tick</code>. The new quantity is the old quantity at that price plus the delta. Drop zero levels; a negative quantity means resync.</td></tr>
       <tr><td><code>CHART_DELTA</code></td><td>63 B</td><td>Check <code>baseSeq</code>. Header ts = candle start. Same candle: add the deltas. Newer start: close the candle and open a new one from zero plus the deltas. Older start: resync.</td></tr>
       <tr><td><code>TRADE_UPDATE</code></td><td>143 B</td><td>Latest 10 trades, IDs <code>seq … seq−9</code>, side = sign of the quantity. Ignore it if <code>seq ≤ last seen</code>. Also updates the LTP when it's the newest trade ID.</td></tr>
-      <tr><td><code>PONG</code></td><td>15 B</td><td>RTT = now − echoed µs timestamp. Over the last 5 RTTs, latency = median and jitter = MAD; send NET_REPORT {latencyMs, jitterMs}. Skipped while the tab is hidden.</td></tr>
+      <tr><td><code>PONG</code></td><td>19 B</td><td>RTT = now − echoed µs timestamp − server hold (the time the server kept the probe beyond the simulated delay, so the server's CPU doesn't count as network). Over the last 5 RTTs, latency = median and jitter = MAD; send NET_REPORT {latencyMs, jitterMs}. Skipped while the tab is hidden.</td></tr>
       <tr><td>JSON control</td><td>—</td><td>HELLO (connId, scales), TIER, SUBSCRIBED, SYNCED, SYNC_FAILED, RESYNC, ERROR, DEBUG_ACK</td></tr>
     </table>
   </div>
