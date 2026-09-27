@@ -2,7 +2,7 @@
 // probes, reconnection and browser-lifecycle handling. It is framework-free;
 // React only sees its output through the store (committed once per frame).
 import { api, HISTORY_LIMIT, type BookSnapshot, type CandlesResponse } from "./api";
-import { LatencyMeter, RateCounter } from "./latency";
+import { HealthMeter, RateCounter } from "./latency";
 import { decodeFrame, encodePing, type ChartDelta, type DepthDelta, type Packet, type TradeUpdate } from "./protocol";
 import { applyDepthDelta, type BookState } from "./sync/book";
 import { applyChartDelta, normalizeCandles, type ChartState } from "./sync/chart";
@@ -29,7 +29,7 @@ export class FeedClient {
 
   private tick = 50;
   private probeSeq = 0;
-  private meter = new LatencyMeter();
+  private meter = new HealthMeter();
   private rates = { chart: new RateCounter(), depth: new RateCounter(), trades: new RateCounter() };
 
   private chartInterval = initialState.chart.interval;
@@ -299,8 +299,8 @@ export class FeedClient {
         reason: String(m.reason ?? ""),
         rates: m.rates as Rates,
         serverEffectiveMs: Number(m.effectiveLatencyMs ?? 0),
-        medianMs: Number(m.medianMs ?? 0),
-        madMs: Number(m.madMs ?? 0),
+        latencyMs: Number(m.latencyMs ?? 0),
+        jitterMs: Number(m.jitterMs ?? 0),
         warmedUp: Boolean(m.warmedUp),
       },
     });
@@ -336,9 +336,9 @@ export class FeedClient {
     }
     if (document.hidden) return; // throttled timers would inflate RTT
     this.meter.add(rtt);
-    const { srtt, rttvar, effective, samples } = this.meter;
-    this.send({ type: "NET_REPORT", rttMs: rtt, srttMs: srtt, rttvarMs: rttvar, samples });
-    this.queue({ net: { rttMs: rtt, srttMs: srtt, rttvarMs: rttvar, effectiveMs: effective, samples } });
+    const { latency, jitter, score, samples } = this.meter;
+    this.send({ type: "NET_REPORT", latencyMs: latency, jitterMs: jitter, rttMs: rtt, samples });
+    this.queue({ net: { rttMs: rtt, latencyMs: latency, jitterMs: jitter, scoreMs: score, samples } });
   }
 
   private publishRates() {

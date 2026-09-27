@@ -73,12 +73,12 @@ export function TierPanel() {
 
         <div className="grid grid-cols-2 gap-x-4 gap-y-1 border-t border-line pt-3 text-xs">
           <Metric label="Last RTT" v={`${f1(net.rttMs)} ms`} />
-          <Metric label="Latency (SRTT)" v={`${f1(net.srttMs)} ms`} />
-          <Metric label="Jitter (RTTVAR)" v={`${f1(net.rttvarMs)} ms`} />
-          <Metric label="Median₅ · MAD₅" v={`${f1(tier.medianMs)} · ${f1(tier.madMs)}`} />
+          <Metric label="Samples" v={`${net.samples}`} />
+          <Metric label="Latency (median₅)" v={`${f1(net.latencyMs)} ms`} />
+          <Metric label="Jitter (MAD₅)" v={`${f1(net.jitterMs)} ms`} />
         </div>
         <div className="flex justify-between rounded-md bg-panel-2 px-2 py-1.5 text-xs">
-          <span className="text-muted">Server score L = median₅ + 4·MAD₅</span>
+          <span className="text-muted">Server score L = latency + 4·jitter</span>
           <span className="num font-semibold">{f1(tier.serverEffectiveMs)} ms</span>
         </div>
         <Thresholds score={tier.serverEffectiveMs} />
@@ -154,7 +154,7 @@ export function DebugPanel() {
               {(
                 [
                   [0, "off"],
-                  [300, "+300 ms → DEGRADED"],
+                  [250, "+250 ms → DEGRADED"],
                   [700, "+700 ms → MINIMAL"],
                 ] as const
               ).map(([ms, label]) => (

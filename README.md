@@ -41,7 +41,7 @@ The whole system runs on **one clock**, the market tick **τ = 50 ms** (20 Hz). 
 3. **Chart intervals are geometric.** FULL = 100 ms (10 Hz: about the fastest a person reads discrete price changes, and 20× faster than Binance's 2 s kline stream). MINIMAL = 1000 ms (1 Hz, still twice as fast as Binance's klines). DEGRADED = √(100·1000) ≈ 316, rounded to 6τ = **300 ms**. Each step is ≈3.3×.
 4. **Order within a tier.** Depth ≥ chart ≥ trades in update rate. Depth = chart/2, but never less than 1τ. Trades come from the latest-10 window: 10 trades at 20/s span 500 ms.
 5. **A tier is eligible if at most one update is in flight.** The pessimistic one-way delay L/2 must not exceed the tier's chart interval T, so **threshold = 2T**: FULL L < 200 ms, DEGRADED L < 600 ms.
-6. **Robust statistics.** L = median₅(RTT) + 4·MAD₅(RTT). The median ignores up to 2 outliers per window; the 4× is RFC 6298's k.
+6. **Robust statistics.** The app reports latency = median₅(RTT) and jitter = MAD₅(RTT); the server scores L = latency + 4·jitter. The median ignores up to 2 outliers per window; the 4× is RFC 6298's k.
 7. **Asymmetric hysteresis.** Demote after 3 reports, promote after 5. Promote at 80% of the threshold (160 / 480 ms): a uniform 20% dead band.
 
 **Generation**, a pure function of the tick n = ⌊(t − 2026-01-01Z)/τ⌋ over a 60 s (1200-tick) cycle:
@@ -139,7 +139,7 @@ src/lib/protocol.ts        binary decoder / PING encoder
 src/lib/sync/streamSync.ts generic "snapshot + ordered deltas" state machine
 src/lib/sync/book.ts       depth delta application
 src/lib/sync/chart.ts      chart delta application, candle rollover, dedupe
-src/lib/latency.ts         SRTT/RTTVAR estimator, rate counters
+src/lib/latency.ts         HealthMeter (latency = median5, jitter = MAD5), rate counters
 src/lib/feed.ts            FeedClient: socket, REST, reconnect, lifecycle, batching
 src/store/market.ts        Zustand store (passive sink)
 src/components/*           UI (chart, book, trades, tier, debug, log)
@@ -182,7 +182,7 @@ All values are fixed-point integers. `GET /api/meta` returns the scales.
 | `GET /api/candles?symbol=BTCUSDT&interval=1m\|5m&limit=1..5000` | `{seq, ltp, candles[], active}`. `seq` is the chart base for SYNC. |
 | `GET /api/orderbook/snapshot?symbol=BTCUSDT` | `{seq, ltp, ltq, tickSize, bids[10], asks[10]}` |
 | `GET /api/trades?symbol=BTCUSDT&from=ms&to=ms&limit=1..5000` | newest first, from the ring buffer, plus `retainedFrom` |
-| `GET /api/ws/status` | per-connection tier, SRTT, RTTVAR, score L, override, sequences, packets, frames and bytes sent |
+| `GET /api/ws/status` | per-connection tier, reported latency and jitter, score L, override, sequences, packets, frames and bytes sent |
 | `POST /api/debug/clients/:id/tier` `{"tier":"AUTO\|FULL\|DEGRADED\|MINIMAL"}` | debug override |
 
 Invalid intervals, limits, ranges and symbols return `400`/`404` with `{"error": "..."}`. Empty history returns `candles: []` and `active: null`.
@@ -260,19 +260,25 @@ The deltas are additive and may be coalesced, so a packet can never be partially
 
 **Server retention.** Ring buffers hold 4096 ticks per stream (about 3.4 min). If a client's base has aged out, the server sends `RESYNC` or `SYNC_FAILED` and the client re-snapshots.
 
-## 7. Latency and jitter measurement
+## 7. Health report: latency and jitter measurement
 
-The client measures on its own clock, reports each sample, and the server decides the tier.
+The app measures and reports; the backend decides (task.txt §3).
 
-- **Probes:** the app sends a binary `PING(probeSeq, performance.now() µs)` and the server echoes it immediately as a `PONG`. It starts with **3 fast-start probes 200 ms apart**, which fill the server's warmup window so the first tier is known in about 0.6 s, then sends 1 probe per second.
-- `RTT = now − echoedTimestamp`. Both timestamps come from the browser's monotonic clock, so no clock synchronisation is needed. Invalid or future probes are ignored.
-- **Latency and jitter** as the app reports them (RFC 6298): `SRTT = ⅞·SRTT + ⅛·RTT` and **jitter = RTTVAR** = `¾·RTTVAR + ¼·|SRTT − RTT|`. Each probe sends `NET_REPORT {rttMs, srttMs, rttvarMs}`.
-- **The server's decision signal** uses the raw `rttMs` samples: **L = median₅ + 4·MAD₅**. EWMA smoothing is fine for display, but as a decision signal it lets one spike inflate 4·RTTVAR for several probes (a single 900 ms spike demoted FULL→MINIMAL) and recovers slowly (28–35 s). The median ignores up to two outliers per window.
-- **Hidden tabs.** Browsers throttle timers in hidden tabs, which would measure the throttling rather than the network. While hidden, samples are skipped and not reported, and the estimator resets when the tab becomes visible again.
+1. **Probe.** The app sends a binary `PING(probeSeq, performance.now() µs)` and the server echoes it immediately as a `PONG`. It starts with **3 fast-start probes 200 ms apart**, then sends 1 per second. `RTT = now − echoedTimestamp` uses only the browser's monotonic clock. A probe is discarded if its seq is in the future, if its RTT is negative or over 60 s, or if it arrives while the tab is hidden (throttled timers would be measured instead of the network).
+2. **Health report.** Over the last **W = 5 RTTs**:
+   - **latency = median(window)**: the typical round trip.
+   - **jitter = MAD = median(|RTTᵢ − latency|)**: the typical deviation.
+
+   The app sends `NET_REPORT {latencyMs, jitterMs, rttMs, samples}` after every probe (`frontend/src/lib/latency.ts`, `HealthMeter`).
+3. **Decision (backend).** The server validates both values (finite, 0 to 60 s) and scores **L = latency + 4·jitter**: a pessimistic round-trip bound, with k = 4 as in RFC 6298. See §8 for the thresholds.
+
+**Why median and MAD rather than RFC 6298's SRTT/RTTVAR.** Both robust statistics tolerate up to 2 outliers in 5, so a latency spike moves neither. With EWMA smoothing, one 900 ms spike inflates 4·RTTVAR for several reports: in simulation it demoted FULL→MINIMAL, and SRTT (α = 1/8) needs about 8 samples to converge, so recovery took 28–35 s. A real change of level is picked up within 3 probes (when 3 of the 5 samples move).
+
+**Worked example (production, India → Singapore).** RTTs [89, 90, 88, 118, 91] → sorted [88, 89, 90, 91, 118] → latency = **90**. Deviations [1, 0, 2, 28, 1] → sorted [0, 1, 1, 2, 28] → jitter = **1**. So L = 90 + 4·1 = **94 ms** → FULL. The 118 ms spike is ignored.
 
 ## 8. Tiers, thresholds and hysteresis
 
-| Tier | L range (L = median₅ + 4·MAD₅) | Depth | Chart | Trades |
+| Tier | L range (L = reported latency + 4·jitter) | Depth | Chart | Trades |
 |---|---|---|---|---|
 | **FULL** | L < 200 ms | 50 ms (1τ, lossless) | 100 ms (2τ) | 250 ms (5τ) |
 | **DEGRADED** | 200 ≤ L < 600 ms | 150 ms (3τ) | 300 ms (6τ) | 500 ms (10τ) |
@@ -294,7 +300,7 @@ The derivation of every number is in [§0](#0-design-in-numbers-every-constant-a
 - **Connection drops:** the reader exits, and the connection leaves its hub with its state released. A WebSocket control ping every 15 s with a 45 s read deadline detects dead TCP connections.
 - **Tier changes never create a new sequence space.** The first packet in the new hub is a catch-up delta from the client's own last tick.
 - **Candle correctness across tiers:** `candle_test.go` (tick-boundary flushes at any cadence reproduce the canonical candles exactly), `TestHubBatchesAndCoalescesByTick` (a DEGRADED frame carries chart and depth `n → n+6` plus the trades in one frame, and nothing is sent when nothing changed), and the e2e test at forced MINIMAL.
-- **Display:** the tier (automatic or forced) and reason, target vs. received rates per stream, RTT/SRTT/RTTVAR, the server's median₅ · MAD₅ and L, the threshold bands, and the current market regime with a countdown.
+- **Display:** the tier (automatic or forced) and reason, target vs. received rates per stream, the last RTT, the reported latency and jitter, the server's score L, the threshold bands, and the current market regime with a countdown.
 
 ## 9. Reconnect, browser lifecycle and stale state
 
@@ -314,7 +320,7 @@ These are for demonstration only. They are in the **Debug controls** panel and a
 | Control | Effect |
 |---|---|
 | Force tier: AUTO / FULL / DEGRADED / MINIMAL | Sends `SET_TIER_OVERRIDE`. The effective tier becomes the override. The automatic state machine keeps running, the UI shows what it *would* choose, and AUTO restores it. Also available as `POST /api/debug/clients/:id/tier`. |
-| Simulated latency: off / **+300 ms → DEGRADED** / **+700 ms → MINIMAL** | The server delays this connection's PONGs so the **automatic** tiering reacts. The presets aim L at the middle of each band (L ≈ 300 + base, ≈ 700 + base). |
+| Simulated latency: off / **+250 ms → DEGRADED** / **+700 ms → MINIMAL** | The server delays this connection's PONGs so the **automatic** tiering reacts. With the measured ~90 ms base, +250 puts L near the middle of the DEGRADED band (≈ 340–400). That leaves room below 600 for the timer lateness of a 0.1-CPU host (see Known limitations). |
 | **Spike (tier should hold)** | Delays exactly one PONG by 900 ms. The median ignores it, which shows the hysteresis working. |
 | Drop depth / chart packet | The server advances its view of the client without sending one packet. The client detects the gap, re-snapshots and resumes, and the event log shows each step. |
 | Kill socket | Closes the socket, then auto-reconnects and resyncs. |
@@ -347,7 +353,7 @@ By default the backend writes **log files instead of printing to the terminal**.
 - **Location:** `LOG_DIR` (default `logs/`, relative to where the server runs). Files are named `backend-YYYY-MM-DD.log`.
 - **Format:** JSON lines by default (`LOG_FORMAT=text` gives key=value lines).
 - **Rotation:** a new file starts at local midnight. A file over `LOG_MAX_MB` (default 50) is renamed to `backend-YYYY-MM-DD.N.log` and a fresh file is opened. Files older than `LOG_MAX_DAYS` (default 7) are deleted.
-- **Contents:** startup, history loading, client connect/disconnect, tier changes with SRTT, RTTVAR and the score L, overrides, debug actions, sequence resyncs, generator rates every 30 s, one access-log line per REST request (method, path, status, compressed bytes, duration), and panics. `/api/health` is logged only at `LOG_LEVEL=debug`, so platform health checks don't flood the file.
+- **Contents:** startup, history loading, client connect/disconnect, tier changes with the score L, overrides, debug actions, sequence resyncs, generator rates every 30 s, one access-log line per REST request (method, path, status, compressed bytes, duration), and panics. `/api/health` is logged only at `LOG_LEVEL=debug`, so platform health checks don't flood the file.
 - **Output modes:** `LOG_OUTPUT=file` (local default), `stdout` (the Docker default, so a platform's log viewer captures it) or `both`.
 
 ```bash
@@ -449,5 +455,6 @@ The frontend is fully static; every route is prerendered. The backend must be **
 - **Book model.** The book is a contiguous tick grid with 10 levels per side, as the packet format requires. Real books can have empty price levels.
 - **RTT includes browser main-thread delay.** If the page is busy, measured latency rises. That is arguably correct for an application-level delivery tier.
 - **Timestamps come from the backend clock.** Timestamps, ids and prices are all derived from it, so a skewed server clock shifts the whole market.
+- **Simulated latency on a 0.1-CPU host.** Delayed PONGs are fired by server timers. On Render's free 0.1 CPU the process is paused whenever its CPU quota runs out, so those timers fire late. On production we measured +300 ms presets producing 390–470 ms RTTs with runs of 625–730 ms, which pushes L over 600. The +250 ms preset leaves room for this; an instance with real CPU doesn't show it.
 - **Race detector.** `go test -race` needs cgo. It runs in CI on Linux; it could not run on the Windows development machine, which has no C compiler.
 - **No watchlist.** There is only one symbol, so the bonus watchlist reordering isn't implemented.

@@ -128,7 +128,7 @@
       <rect x="572" y="286" width="196" height="84" rx="8" class="b4"/>
       <text x="584" y="306">Client manager</text>
       <text x="584" y="324" class="m">tier machine per connection</text>
-      <text x="584" y="342" class="m">L = median₅ + 4·MAD₅</text>
+      <text x="584" y="342" class="m">L = latency + 4·jitter</text>
       <text x="584" y="360" class="m">missing-report watchdog 250 ms</text>
       <rect x="572" y="380" width="196" height="40" rx="8" class="b3"/>
       <text x="584" y="398" class="mono">FULL  1τ / 2τ / 5τ</text>
@@ -298,11 +298,11 @@
       </g>
       <g style="color: var(--warn)">
         <path d="M375,600 L642,600" class="ar-w" marker-end="url(#a2)"/>
-        <text x="390" y="594">NET_REPORT {rtt, SRTT, RTTVAR} → window of 5 RTTs</text>
+        <text x="390" y="594">NET_REPORT {latency = median₅, jitter = MAD₅}</text>
       </g>
       <g style="color: var(--up)">
         <path d="M645,630 L378,630" class="ar-u" marker-end="url(#a2)"/>
-        <text x="420" y="624">L = median₅ + 4·MAD₅ → TIER on change → move hub</text>
+        <text x="420" y="624">L = latency + 4·jitter → TIER on change → move hub</text>
       </g>
 
       <g style="color: var(--warn)">
@@ -353,7 +353,7 @@
       <svg viewBox="0 0 560 360" role="img" aria-label="Tier state machine" style="min-width:520px">
         <defs><marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
         <text x="16" y="24" class="t">Server tier machine</text>
-        <text x="16" y="44" class="m">L = median₅ + 4·MAD₅ of reported RTTs; threshold = 2 × chart interval; warmup 3</text>
+        <text x="16" y="44" class="m">L = reported latency + 4·jitter; threshold = 2 × chart interval; warmup 3</text>
         <rect x="30" y="150" width="120" height="48" rx="24" class="b3"/><text x="72" y="179">FULL</text>
         <rect x="220" y="150" width="120" height="48" rx="24" class="b2"/><text x="244" y="179">DEGRADED</text>
         <rect x="410" y="150" width="120" height="48" rx="24" class="b4"/><text x="442" y="179">MINIMAL</text>
@@ -384,7 +384,7 @@
       <tr><td><code>DEPTH_DELTA</code></td><td>115 B</td><td>Check <code>baseSeq</code>. Rebuild the 10 levels from <code>bestBid/bestAsk ∓ i·tick</code>. The new quantity is the old quantity at that price plus the delta. Drop zero levels; a negative quantity means resync.</td></tr>
       <tr><td><code>CHART_DELTA</code></td><td>63 B</td><td>Check <code>baseSeq</code>. Header ts = candle start. Same candle: add the deltas. Newer start: close the candle and open a new one from zero plus the deltas. Older start: resync.</td></tr>
       <tr><td><code>TRADE_UPDATE</code></td><td>143 B</td><td>Latest 10 trades, IDs <code>seq … seq−9</code>, side = sign of the quantity. Ignore it if <code>seq ≤ last seen</code>. Also updates the LTP when it's the newest trade ID.</td></tr>
-      <tr><td><code>PONG</code></td><td>15 B</td><td>RTT = now − echoed µs timestamp. Update SRTT and RTTVAR (shown as latency and jitter), then send NET_REPORT with the raw RTT for the server's robust score. Skipped while the tab is hidden.</td></tr>
+      <tr><td><code>PONG</code></td><td>15 B</td><td>RTT = now − echoed µs timestamp. Over the last 5 RTTs, latency = median and jitter = MAD; send NET_REPORT {latencyMs, jitterMs}. Skipped while the tab is hidden.</td></tr>
       <tr><td>JSON control</td><td>—</td><td>HELLO (connId, scales), TIER, SUBSCRIBED, SYNCED, SYNC_FAILED, RESYNC, ERROR, DEBUG_ACK</td></tr>
     </table>
   </div>

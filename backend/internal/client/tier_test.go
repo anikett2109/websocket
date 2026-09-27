@@ -19,6 +19,7 @@ type driver struct {
 	m       *Machine
 	now     time.Time
 	i       int
+	window  []time.Duration // the browser's last-5 RTT window
 	changes []string
 }
 
@@ -27,11 +28,17 @@ func newDriver(t *testing.T) *driver {
 	return &driver{t: t, m: NewMachine(cfg, now), now: now}
 }
 
-// feed reports one sample per second and records tier changes.
+// feed probes once per second like the browser: keep the last 5 RTTs,
+// report latency = median and jitter = MAD, and record tier changes.
 func (d *driver) feed(rtts ...time.Duration) {
 	for _, r := range rtts {
 		d.now = d.now.Add(time.Second)
-		if reason := d.m.Report(r, d.now); reason != "" {
+		d.window = append(d.window, r)
+		if len(d.window) > Window {
+			d.window = d.window[1:]
+		}
+		_, latency, jitter := Summarize(d.window)
+		if reason := d.m.Report(latency, jitter, d.now); reason != "" {
 			d.changes = append(d.changes, d.m.Tier().String())
 		}
 		d.i++
@@ -51,8 +58,8 @@ func (d *driver) want(tier Tier, note string) {
 	}
 }
 
-func TestScore(t *testing.T) {
-	l, med, mad := Score([]time.Duration{80 * ms, 90 * ms, 100 * ms, 900 * ms, 85 * ms})
+func TestSummarize(t *testing.T) {
+	l, med, mad := Summarize([]time.Duration{80 * ms, 90 * ms, 100 * ms, 900 * ms, 85 * ms})
 	if med != 90*ms || mad != 10*ms || l != 130*ms {
 		t.Fatalf("L=%v median=%v mad=%v", l, med, mad)
 	}

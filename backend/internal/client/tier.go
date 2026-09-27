@@ -1,23 +1,25 @@
 // Package client holds the per-connection delivery-tier state machine.
 //
-// # Signal
+// # Health report (browser)
 //
-// The browser probes RTT once per second over the WebSocket and reports each
-// sample (plus its RFC 6298 SRTT/RTTVAR, shown in the UI as latency/jitter).
-// The server keeps the last W = 5 samples and scores the connection with a
-// robust pessimistic latency bound:
+// The app probes RTT over the WebSocket (PING/PONG, 1/s after 3 fast-start
+// probes) and keeps the last W = 5 RTTs. After every probe it reports
 //
-//	L = median(last 5 RTT) + 4 · MAD(last 5 RTT)
+//	latency = median(window)                    typical round trip
+//	jitter  = median(|RTTi - latency|)  (MAD)   typical deviation
 //
-// The median ignores up to two outliers in the window, so one or two latency
-// spikes cannot move the score; MAD (median absolute deviation) is the robust
-// counterpart of RTTVAR and keeps RFC 6298's k = 4.
+// Both are robust: up to 2 of 5 samples can be outliers without moving them.
 //
-// # Thresholds
+// # Decision (server)
 //
-// A tier is eligible when at most one update is in flight: the pessimistic
-// one-way delay L/2 must not exceed the tier's chart interval T, i.e. L ≤ 2T.
-// With T = 100 ms (FULL) and 300 ms (DEGRADED):
+// The server owns the tier and scores the reported values as a pessimistic
+// round-trip bound (k = 4, as in RFC 6298):
+//
+//	L = latency + 4 * jitter
+//
+// A tier is eligible when at most one update is in flight: the one-way delay
+// L/2 must fit in the tier's chart interval T, i.e. L <= 2T. With T = 100 ms
+// (FULL) and 300 ms (DEGRADED):
 //
 //	FULL      L < 200 ms
 //	DEGRADED  L < 600 ms
@@ -25,9 +27,8 @@
 //
 // Promotion requires L below 80 % of the threshold (160 / 480 ms): a uniform
 // 20 % dead band. Demotion needs 3 consecutive reports past a threshold,
-// promotion 5 consecutive reports inside the band; promoting slower than a
-// typical flap stops oscillation (simulated 3 s bad / 3 s good: 5 changes with
-// ×5, 21 with ×3).
+// promotion 5 consecutive reports inside the band (simulated 3 s bad / 3 s
+// good: 5 changes with x5, 21 with x3).
 package client
 
 import (
@@ -59,7 +60,7 @@ func ParseTier(s string) (Tier, bool) {
 }
 
 const (
-	Window = 5 // samples in the robust window
+	Window = 5 // probes in the client's robust window
 
 	ChartFull     = 100 * time.Millisecond // FULL chart interval (T)
 	ChartDegraded = 300 * time.Millisecond // DEGRADED chart interval
@@ -85,8 +86,9 @@ func Classify(l time.Duration) Tier {
 	}
 }
 
-// Score computes L = median + 4·MAD over samples (any length >= 1).
-func Score(samples []time.Duration) (l, median, mad time.Duration) {
+// Summarize is the client's health-report math (mirrors the browser's
+// HealthMeter): latency = median, jitter = MAD, score L = latency + 4*jitter.
+func Summarize(samples []time.Duration) (l, median, mad time.Duration) {
 	median = medianOf(samples)
 	dev := make([]time.Duration, len(samples))
 	for i, s := range samples {
@@ -117,14 +119,13 @@ type MachineConfig struct {
 type Machine struct {
 	cfg        MachineConfig
 	tier       Tier
-	window     []time.Duration
 	samples    int
 	demote     int
 	promote    int
 	lastReport time.Time
 	score      time.Duration
-	median     time.Duration
-	mad        time.Duration
+	latency    time.Duration
+	jitter     time.Duration
 }
 
 // NewMachine starts in DEGRADED: until warmup completes the link is unknown,
@@ -133,24 +134,21 @@ func NewMachine(cfg MachineConfig, now time.Time) *Machine {
 	return &Machine{cfg: cfg, tier: Degraded, lastReport: now}
 }
 
-func (m *Machine) Tier() Tier                         { return m.tier }
-func (m *Machine) Score() time.Duration               { return m.score }
-func (m *Machine) Stats() (median, mad time.Duration) { return m.median, m.mad }
-func (m *Machine) Samples() int                       { return m.samples }
-func (m *Machine) LastReport() time.Time              { return m.lastReport }
-func (m *Machine) WarmedUp() bool                     { return m.samples >= m.cfg.WarmupSamples }
-func (m *Machine) Counters() (demote, promote int)    { return m.demote, m.promote }
+func (m *Machine) Tier() Tier                             { return m.tier }
+func (m *Machine) Score() time.Duration                   { return m.score }
+func (m *Machine) Stats() (latency, jitter time.Duration) { return m.latency, m.jitter }
+func (m *Machine) Samples() int                           { return m.samples }
+func (m *Machine) LastReport() time.Time                  { return m.lastReport }
+func (m *Machine) WarmedUp() bool                         { return m.samples >= m.cfg.WarmupSamples }
+func (m *Machine) Counters() (demote, promote int)        { return m.demote, m.promote }
 
-// Report feeds one RTT sample. It returns a non-empty reason when the tier changed.
-func (m *Machine) Report(rtt time.Duration, now time.Time) string {
+// Report feeds one health report (the client's latency and jitter). It
+// returns a non-empty reason when the tier changed.
+func (m *Machine) Report(latency, jitter time.Duration, now time.Time) string {
 	m.lastReport = now
 	m.samples++
-	m.window = append(m.window, rtt)
-	if len(m.window) > Window {
-		m.window = m.window[1:]
-	}
-	l, med, mad := Score(m.window)
-	m.score, m.median, m.mad = l, med, mad
+	l := latency + 4*jitter
+	m.score, m.latency, m.jitter = l, latency, jitter
 
 	if m.samples < m.cfg.WarmupSamples {
 		return ""

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LatencyMeter } from "../latency";
+import { HealthMeter } from "../latency";
 import { decode, decodeFrame, encodePing, MalformedPacketError, PacketType, Sizes } from "../protocol";
 import { formatFixed, fmtChangePct } from "../fixed";
 
@@ -92,16 +92,19 @@ describe("batched frames", () => {
   });
 });
 
-describe("latency estimator (RFC 6298 style)", () => {
-  it("initialises from the first sample and smooths afterwards", () => {
-    const m = new LatencyMeter();
-    m.add(100);
-    expect(m.srtt).toBe(100);
-    expect(m.rttvar).toBe(50);
-    m.add(20);
-    expect(m.rttvar).toBeCloseTo(0.75 * 50 + 0.25 * 80);
-    expect(m.srtt).toBeCloseTo(0.875 * 100 + 0.125 * 20);
-    expect(m.effective).toBeCloseTo(m.srtt + 4 * m.rttvar);
+describe("health report (latency = median5, jitter = MAD5)", () => {
+  it("ignores a single spike and scores latency + 4*jitter", () => {
+    const m = new HealthMeter();
+    for (const r of [89, 90, 88, 118, 91]) m.add(r);
+    expect(m.latency).toBe(90);
+    expect(m.jitter).toBe(1);
+    expect(m.score).toBe(94);
+  });
+  it("keeps only the last 5 probes", () => {
+    const m = new HealthMeter();
+    for (const r of [90, 90, 90, 90, 90, 420, 420, 420]) m.add(r);
+    expect(m.latency).toBe(420); // 3 of 5 recent samples moved the median
+    expect(m.samples).toBe(8);
   });
 });
 

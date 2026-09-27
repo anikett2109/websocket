@@ -1,45 +1,54 @@
-// Round-trip measurement over the WebSocket, RFC 6298 style.
+// Health report: round-trip measurement over the WebSocket.
 //
-// Every second the app sends a binary PING carrying its own clock
-// (performance.now() in microseconds). The server echoes it unchanged in a
-// PONG, so RTT = now - echoedTimestamp uses only the browser's monotonic clock
-// (no clock-sync needed between browser and server).
+// The app sends a binary PING carrying its own clock (performance.now() in
+// microseconds); the server echoes it in a PONG, so RTT = now - echoedTimestamp
+// uses only the browser's monotonic clock (no clock sync needed).
 //
-//   first sample:  SRTT = RTT, RTTVAR = RTT / 2
-//   afterwards:    RTTVAR = (1 - 1/4) * RTTVAR + 1/4 * |SRTT - RTT|
-//                  SRTT   = (1 - 1/8) * SRTT   + 1/8 * RTT
-//
-// "Jitter" is reported as RTTVAR (the smoothed mean deviation of RTT).
-// The backend combines them as EffectiveLatency = SRTT + 4 * RTTVAR.
+// Over the last W = 5 RTTs the app reports
+//   latency = median(window)                    the typical round trip
+//   jitter  = median(|RTT_i - latency|)  (MAD)  the typical deviation
+// Both are robust: up to 2 of 5 samples can be outliers (a latency spike)
+// without moving them. The backend owns the tier and scores
+//   L = latency + 4 * jitter.
 
-export const ALPHA = 1 / 8;
-export const BETA = 1 / 4;
+export const WINDOW = 5;
 
-export class LatencyMeter {
-  srtt = 0;
-  rttvar = 0;
+const median = (xs: number[]) => {
+  const s = [...xs].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+
+export class HealthMeter {
+  private window: number[] = [];
   last = 0;
   samples = 0;
 
   add(rttMs: number) {
     if (!Number.isFinite(rttMs) || rttMs < 0) return;
     this.last = rttMs;
-    if (this.samples === 0) {
-      this.srtt = rttMs;
-      this.rttvar = rttMs / 2;
-    } else {
-      this.rttvar = (1 - BETA) * this.rttvar + BETA * Math.abs(this.srtt - rttMs);
-      this.srtt = (1 - ALPHA) * this.srtt + ALPHA * rttMs;
-    }
     this.samples++;
+    this.window.push(rttMs);
+    if (this.window.length > WINDOW) this.window.shift();
   }
 
-  get effective() {
-    return this.srtt + 4 * this.rttvar;
+  get latency() {
+    return this.window.length ? median(this.window) : 0;
+  }
+
+  get jitter() {
+    const l = this.latency;
+    return this.window.length ? median(this.window.map((x) => Math.abs(x - l))) : 0;
+  }
+
+  /** The score the backend computes from this report. */
+  get score() {
+    return this.latency + 4 * this.jitter;
   }
 
   reset() {
-    this.srtt = this.rttvar = this.last = this.samples = 0;
+    this.window = [];
+    this.last = this.samples = 0;
   }
 }
 

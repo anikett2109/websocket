@@ -200,7 +200,7 @@ func (s *Server) applyTier(c *Client, reason string, notify bool) {
 		}
 		if c.tier >= 0 {
 			slog.Info("client tier changed", "conn", c.id, "from", c.tier, "to", eff, "reason", reason,
-				"srtt", c.srtt, "rttvar", c.rttvar, "effective", c.machine.Score())
+				"score", c.machine.Score())
 		}
 		c.tier = eff
 		c.hub = s.hubs[eff]
@@ -215,7 +215,7 @@ func (s *Server) applyTier(c *Client, reason string, notify bool) {
 		return
 	}
 	c.tierSentAt = time.Now()
-	median, mad := c.machine.Stats()
+	latency, jitter := c.machine.Stats()
 	override := "AUTO"
 	if c.override != nil {
 		override = c.override.String()
@@ -224,10 +224,8 @@ func (s *Server) applyTier(c *Client, reason string, notify bool) {
 		"type": "TIER", "tier": eff.String(), "autoTier": auto.String(), "override": override,
 		"changed": changed, "reason": c.tierReason,
 		"effectiveLatencyMs": float64(c.machine.Score().Microseconds()) / 1000, // L = median + 4·MAD
-		"medianMs":           float64(median.Microseconds()) / 1000,
-		"madMs":              float64(mad.Microseconds()) / 1000,
-		"srttMs":             float64(c.srtt.Microseconds()) / 1000,
-		"rttvarMs":           float64(c.rttvar.Microseconds()) / 1000,
+		"latencyMs":          float64(latency.Microseconds()) / 1000,
+		"jitterMs":           float64(jitter.Microseconds()) / 1000,
 		"samples":            c.machine.Samples(), "warmedUp": c.machine.WarmedUp(),
 		"rates": rateJSON(s.hubs[eff].rates),
 	}
@@ -275,8 +273,8 @@ type ClientStatus struct {
 	Tier               string            `json:"tier"`
 	AutoTier           string            `json:"autoTier"`
 	Override           string            `json:"override"`
-	SRTTMs             float64           `json:"srttMs"`
-	RTTVarMs           float64           `json:"rttvarMs"`
+	LatencyMs          float64           `json:"latencyMs"`
+	JitterMs           float64           `json:"jitterMs"`
 	EffectiveLatencyMs float64           `json:"effectiveLatencyMs"`
 	Samples            int               `json:"samples"`
 	LastReportAgoMs    int64             `json:"lastReportAgoMs"`
@@ -297,8 +295,8 @@ func (s *Server) Status() []ClientStatus {
 		}
 		st := ClientStatus{
 			ID: c.id, ConnectedAt: c.since, Tier: c.tier.String(), AutoTier: c.machine.Tier().String(), Override: ov,
-			SRTTMs:             float64(c.srtt.Microseconds()) / 1000,
-			RTTVarMs:           float64(c.rttvar.Microseconds()) / 1000,
+			LatencyMs:          ms(c.machine.Stats()),
+			JitterMs:           msJ(c.machine.Stats()),
 			EffectiveLatencyMs: float64(c.machine.Score().Microseconds()) / 1000,
 			Samples:            c.machine.Samples(),
 			LastReportAgoMs:    time.Since(c.machine.LastReport()).Milliseconds(),
@@ -318,3 +316,6 @@ func newID() string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+func ms(latency, _ time.Duration) float64 { return float64(latency.Microseconds()) / 1000 }
+func msJ(_, jitter time.Duration) float64 { return float64(jitter.Microseconds()) / 1000 }

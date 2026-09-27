@@ -58,8 +58,6 @@ type Client struct {
 	tierReason  string    // reason for the last tier change, repeated in keepalives
 	dropDepth   bool
 	dropChart   bool
-	srtt        time.Duration
-	rttvar      time.Duration
 	stats       counters
 }
 
@@ -177,17 +175,17 @@ func (c *Client) handleBinary(b []byte) {
 }
 
 type controlMsg struct {
-	Type     string  `json:"type"`
-	Symbol   string  `json:"symbol"`
-	Interval string  `json:"interval"`
-	Stream   string  `json:"stream"`
-	Seq      *uint32 `json:"seq"`
-	Tier     string  `json:"tier"`
-	Action   string  `json:"action"`
-	Ms       float64 `json:"ms"`
-	SRTTMs   float64 `json:"srttMs"`
-	RTTVarMs float64 `json:"rttvarMs"`
-	RTTMs    float64 `json:"rttMs"`
+	Type      string  `json:"type"`
+	Symbol    string  `json:"symbol"`
+	Interval  string  `json:"interval"`
+	Stream    string  `json:"stream"`
+	Seq       *uint32 `json:"seq"`
+	Tier      string  `json:"tier"`
+	Action    string  `json:"action"`
+	Ms        float64 `json:"ms"`
+	RTTMs     float64 `json:"rttMs"`
+	LatencyMs float64 `json:"latencyMs"`
+	JitterMs  float64 `json:"jitterMs"`
 }
 
 func (c *Client) sendError(msg string) {
@@ -281,22 +279,21 @@ func validMs(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >
 // outlier the robust median must ignore (the tier should not change).
 const SpikeDelay = 900 * time.Millisecond
 
-// netReport feeds the probe's RTT sample to the tier machine. SRTT/RTTVAR are
-// the client's own smoothed latency/jitter, kept for display and status.
+// netReport is the health report: the browser's latency (median of its last
+// 5 RTTs) and jitter (their MAD). The server scores L = latency + 4*jitter.
 func (c *Client) netReport(m controlMsg) {
-	if !validMs(m.RTTMs) || !validMs(m.SRTTMs) || !validMs(m.RTTVarMs) {
-		c.sendError("invalid NET_REPORT values")
+	if !validMs(m.LatencyMs) || !validMs(m.JitterMs) || !validMs(m.RTTMs) {
+		c.sendError("invalid NET_REPORT: latencyMs, jitterMs and rttMs must be 0..60000")
 		return
 	}
 	ms := func(v float64) time.Duration { return time.Duration(v * float64(time.Millisecond)) }
-	rtt := ms(m.RTTMs)
+	latency, jitter := ms(m.LatencyMs), ms(m.JitterMs)
 	c.mu.Lock()
-	c.srtt, c.rttvar = ms(m.SRTTMs), ms(m.RTTVarMs)
-	reason := c.machine.Report(rtt, time.Now())
+	reason := c.machine.Report(latency, jitter, time.Now())
 	score := c.machine.Score()
 	c.mu.Unlock()
 	if c.srv.cfg.Debug {
-		slog.Debug("net report", "conn", c.id, "rtt", rtt, "score", score)
+		slog.Debug("net report", "conn", c.id, "latency", latency, "jitter", jitter, "score", score)
 	}
 	c.srv.applyTier(c, reason, false)
 }
