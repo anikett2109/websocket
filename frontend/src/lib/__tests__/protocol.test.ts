@@ -61,19 +61,19 @@ describe("binary protocol", () => {
     expect(() => decode(header(PacketType.ChartDelta, 15, 1, 1).buf)).toThrow(MalformedPacketError); // wrong size
   });
 
-  it("encodes PING as 15 B; PONG echoes it plus the server hold", () => {
-    expect(encodePing(7, 123456).byteLength).toBe(Sizes.probe);
-    const { buf, v } = header(PacketType.Pong, 19, 7, 123456);
-    v.setUint32(15, 81_000, true);
-    expect(decode(buf)).toEqual({ kind: "pong", seq: 7, ts: 123456, holdUs: 81_000 });
+  it("encodes PING as a 15 B header echoed back as PONG", () => {
+    const ping = encodePing(7, 123456);
+    expect(ping.byteLength).toBe(Sizes.probe);
+    new DataView(ping).setUint8(0, PacketType.Pong);
+    expect(decode(ping)).toEqual({ kind: "pong", seq: 7, ts: 123456 });
   });
 });
 
 describe("batched frames", () => {
   it("splits one frame into its packets by the length field", () => {
     const a = header(PacketType.ChartDelta, 63, 7, 60_000).buf;
-    const b = header(PacketType.Pong, 19, 3, 99).buf;
-    const frame = new Uint8Array(82);
+    const b = header(PacketType.Pong, 15, 3, 99).buf;
+    const frame = new Uint8Array(78);
     frame.set(new Uint8Array(a), 0);
     frame.set(new Uint8Array(b), 63);
     const { packets, error } = decodeFrame(frame.buffer);
@@ -82,10 +82,10 @@ describe("batched frames", () => {
   });
 
   it("keeps packets before a malformed one and reports the error", () => {
-    const a = header(PacketType.Pong, 19, 3, 99).buf;
-    const frame = new Uint8Array(19 + 20);
+    const a = header(PacketType.Pong, 15, 3, 99).buf;
+    const frame = new Uint8Array(15 + 20);
     frame.set(new Uint8Array(a), 0);
-    frame.set([1, 200, 0], 19); // claims 200 bytes, only 20 left
+    frame.set([1, 200, 0], 15); // claims 200 bytes, only 20 left
     const { packets, error } = decodeFrame(frame.buffer);
     expect(packets).toHaveLength(1);
     expect(error).toMatch(/bad packet length/);

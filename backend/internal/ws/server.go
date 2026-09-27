@@ -275,6 +275,7 @@ type ClientStatus struct {
 	Override           string            `json:"override"`
 	LatencyMs          float64           `json:"latencyMs"`
 	JitterMs           float64           `json:"jitterMs"`
+	SimulatedMs        float64           `json:"simulatedMs"`
 	EffectiveLatencyMs float64           `json:"effectiveLatencyMs"`
 	Samples            int               `json:"samples"`
 	LastReportAgoMs    int64             `json:"lastReportAgoMs"`
@@ -297,6 +298,7 @@ func (s *Server) Status() []ClientStatus {
 			ID: c.id, ConnectedAt: c.since, Tier: c.tier.String(), AutoTier: c.machine.Tier().String(), Override: ov,
 			LatencyMs:          ms(c.machine.Stats()),
 			JitterMs:           msJ(c.machine.Stats()),
+			SimulatedMs:        float64(c.simulated.Microseconds()) / 1000,
 			EffectiveLatencyMs: float64(c.machine.Score().Microseconds()) / 1000,
 			Samples:            c.machine.Samples(),
 			LastReportAgoMs:    time.Since(c.machine.LastReport()).Milliseconds(),

@@ -32,7 +32,6 @@ const (
 	DepthDeltaSize  = HeaderSize + 4 + 8 + 8 + 2*model.Levels*4 // 115
 	TradeUpdateSize = HeaderSize + 8 + 10*12                    // 143
 	PingSize        = HeaderSize                                // 15
-	PongSize        = HeaderSize + 4                            // 19: + server hold (µs)
 	TradesPerUpdate = 10
 )
 
@@ -167,20 +166,7 @@ func DecodeTradeUpdate(b []byte) ([]model.Trade, error) {
 	return out, nil
 }
 
-// EncodePong echoes a PING's seq and client timestamp and appends the server
-// hold time in microseconds: how long the server kept this probe beyond any
-// intentionally simulated delay (CPU scheduling, timer lateness). The client
-// subtracts it from the RTT, as NTP subtracts server processing time
-// (delay = (t4−t1) − (t3−t2)), so the tier reflects the client's network, not
-// the server's CPU.
-func EncodePong(seq uint32, ts int64, holdMicros uint32) []byte {
-	b := make([]byte, PongSize)
-	putHeader(b, TypePong, seq, ts)
-	le.PutUint32(b[15:], holdMicros)
-	return b
-}
-
-// EncodeProbe builds a PING: a bare header. For PING/PONG, seq is the probe
+// EncodeProbe builds a PING or PONG: a bare header. For PING/PONG, seq is the probe
 // sequence and ts is the sender's clock (echoed back unchanged in PONG).
 func EncodeProbe(typ uint8, seq uint32, ts int64) []byte {
 	b := make([]byte, PingSize)

@@ -97,11 +97,3 @@ func TestSplitFrame(t *testing.T) {
 		t.Fatal("truncated frame accepted")
 	}
 }
-
-func TestPongCarriesHold(t *testing.T) {
-	b := EncodePong(9, 12345, 81_000)
-	h, err := ReadHeader(b)
-	if err != nil || len(b) != PongSize || h.Seq != 9 || h.TS != 12345 || le.Uint32(b[15:]) != 81_000 {
-		t.Fatalf("pong %v %+v err %v", b, h, err)
-	}
-}

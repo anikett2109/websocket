@@ -52,10 +52,11 @@ type Client struct {
 	depthSynced bool
 	depthSeq    uint32
 	lastTradeID uint32
-	simLatency  time.Duration
-	spikeNext   bool      // debug: delay the next PONG by SpikeDelay
-	tierSentAt  time.Time // last TIER message (keepalive every tierKeepalive)
-	tierReason  string    // reason for the last tier change, repeated in keepalives
+	simLatency  time.Duration // server-side PONG delay (legacy debug action; the UI injects latency client-side)
+	simulated   time.Duration // latency the app reports it injected (debug), for logs/status
+	spikeNext   bool          // debug: delay the next PONG by SpikeDelay
+	tierSentAt  time.Time     // last TIER message (keepalive every tierKeepalive)
+	tierReason  string        // reason for the last tier change, repeated in keepalives
 	dropDepth   bool
 	dropChart   bool
 	stats       counters
@@ -159,7 +160,7 @@ func (c *Client) handleBinary(b []byte) {
 		c.sendError("malformed or unexpected binary packet")
 		return
 	}
-	received := time.Now()
+	pong := frame{data: protocol.EncodeProbe(protocol.TypePong, h.Seq, h.TS)}
 	c.mu.Lock()
 	delay := c.simLatency
 	if c.spikeNext {
@@ -167,18 +168,11 @@ func (c *Client) handleBinary(b []byte) {
 		c.spikeNext = false
 	}
 	c.mu.Unlock()
-	// hold = time spent in this process beyond the intended delay. On a
-	// 0.1-CPU host the process is paused when its CPU quota runs out, so
-	// timers fire late; that lateness is the server's, not the client's network.
-	send := func() {
-		hold := max(0, time.Since(received)-delay)
-		c.enqueue(frame{data: protocol.EncodePong(h.Seq, h.TS, uint32(min(hold.Microseconds(), 1<<32-1)))})
-	}
 	if delay > 0 {
-		afterFunc(delay, send)
+		time.AfterFunc(delay, func() { c.enqueue(pong) })
 		return
 	}
-	send()
+	c.enqueue(pong)
 }
 
 type controlMsg struct {
@@ -193,6 +187,7 @@ type controlMsg struct {
 	RTTMs     float64 `json:"rttMs"`
 	LatencyMs float64 `json:"latencyMs"`
 	JitterMs  float64 `json:"jitterMs"`
+	SimMs     float64 `json:"simulatedMs"` // debug latency the app injected into this RTT
 }
 
 func (c *Client) sendError(msg string) {
@@ -282,9 +277,6 @@ func (c *Client) sync(m controlMsg) {
 
 func validMs(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v < 60_000 }
 
-// afterFunc schedules delayed PONGs (replaceable in tests to model a late timer).
-var afterFunc = time.AfterFunc
-
 // SpikeDelay is the debug "Spike" action: one PONG delayed by 900 ms, a single
 // outlier the robust median must ignore (the tier should not change).
 const SpikeDelay = 900 * time.Millisecond
@@ -299,6 +291,7 @@ func (c *Client) netReport(m controlMsg) {
 	ms := func(v float64) time.Duration { return time.Duration(v * float64(time.Millisecond)) }
 	latency, jitter := ms(m.LatencyMs), ms(m.JitterMs)
 	c.mu.Lock()
+	c.simulated = ms(m.SimMs)
 	reason := c.machine.Report(latency, jitter, time.Now())
 	score := c.machine.Score()
 	c.mu.Unlock()

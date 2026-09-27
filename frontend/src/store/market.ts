@@ -47,7 +47,7 @@ export interface MarketState {
     warmedUp: boolean;
     table: Record<TierName, Rates> | null;
   };
-  net: { rttMs: number; holdMs: number; latencyMs: number; jitterMs: number; scoreMs: number; samples: number };
+  net: { rttMs: number; latencyMs: number; jitterMs: number; scoreMs: number; samples: number };
   measured: { chart: number; depth: number; trades: number };
   ticker: { ltp: number | null; ltpSeq: number; dir: 1 | -1 | 0; open24h: number | null; high24h: number | null; low24h: number | null; volume24h: number | null };
   book: { bids: Level[]; asks: Level[]; seq: number; phase: Phase; updatedAt: number };
@@ -72,7 +72,7 @@ export const initialState: MarketState = {
   conn: { status: "connecting", connId: null, lastMessageAt: 0, disconnectedAt: null, reconnectAt: null, attempt: 0, paused: false },
   tier: { tier: null, autoTier: null, override: "AUTO", reason: "", rates: null, serverEffectiveMs: 0, latencyMs: 0, jitterMs: 0, warmedUp: false, table: null },
   clock: null,
-  net: { rttMs: 0, holdMs: 0, latencyMs: 0, jitterMs: 0, scoreMs: 0, samples: 0 },
+  net: { rttMs: 0, latencyMs: 0, jitterMs: 0, scoreMs: 0, samples: 0 },
   measured: { chart: 0, depth: 0, trades: 0 },
   ticker: { ltp: null, ltpSeq: 0, dir: 0, open24h: null, high24h: null, low24h: null, volume24h: null },
   book: { bids: [], asks: [], seq: 0, phase: "idle", updatedAt: 0 },

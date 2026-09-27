@@ -114,7 +114,7 @@ func (a *API) meta(c *gin.Context) {
 		"tickSize": a.market.TickSize(), "intervals": []string{"1m", "5m"}, "wsPath": a.cfg.WSPath,
 		"packets": gin.H{
 			"CHART_DELTA": protocol.ChartDeltaSize, "DEPTH_DELTA": protocol.DepthDeltaSize,
-			"TRADE_UPDATE": protocol.TradeUpdateSize, "PING": protocol.PingSize, "PONG": protocol.PongSize,
+			"TRADE_UPDATE": protocol.TradeUpdateSize, "PING": protocol.PingSize, "PONG": protocol.PingSize,
 		},
 	})
 }

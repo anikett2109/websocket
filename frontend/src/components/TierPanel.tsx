@@ -72,8 +72,8 @@ export function TierPanel() {
         </p>
 
         <div className="grid grid-cols-2 gap-x-4 gap-y-1 border-t border-line pt-3 text-xs">
-          <Metric label="Last RTT (network)" v={`${f1(net.rttMs)} ms`} />
-          <Metric label="Server hold" v={`${f1(net.holdMs)} ms`} />
+          <Metric label="Last RTT" v={`${f1(net.rttMs)} ms`} />
+          <Metric label="Samples" v={`${net.samples}`} />
           <Metric label="Latency (median₅)" v={`${f1(net.latencyMs)} ms`} />
           <Metric label="Jitter (MAD₅)" v={`${f1(net.jitterMs)} ms`} />
         </div>
@@ -147,7 +147,7 @@ export function DebugPanel() {
         </div>
         <div>
           <div className="mb-1 text-muted">
-            Simulated latency: the server delays PONGs so the automatic tiering reacts. Presets aim L at the middle of each band.
+            Simulated latency: added to every measured RTT before the health report, so the server&apos;s automatic tiering reacts. Presets aim L at the middle of each band.
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <div className="inline-flex flex-wrap rounded-md bg-panel-2 p-0.5">
@@ -163,7 +163,7 @@ export function DebugPanel() {
                 </button>
               ))}
             </div>
-            <button className={btn} disabled={!live} onClick={() => feed?.spike()} title="Delays one PONG by 900 ms; the median ignores it">
+            <button className={btn} disabled={!live} onClick={() => feed?.spike()} title="Adds 900 ms to one RTT sample; the median ignores it">
               Spike (tier should hold)
             </button>
           </div>

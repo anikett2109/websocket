@@ -11,6 +11,7 @@ import { commit, initialState, useMarket, type LogEvent, type MarketState, type 
 
 const PING_EVERY_MS = 1000;
 const FAST_START_MS = [200, 400];
+const SPIKE_MS = 900;
 const TICKER_EVERY_MS = 30_000;
 const MAX_BACKOFF_MS = 10_000;
 
@@ -258,7 +259,7 @@ export class FeedClient {
         this.rates.trades.hit(now);
         return this.onTrades(p);
       case "pong":
-        return this.onPong(p.seq, p.ts, p.holdUs);
+        return this.onPong(p.seq, p.ts);
     }
   }
 
@@ -285,7 +286,6 @@ export class FeedClient {
     this.depth.start("initial");
     this.subscribeChart("initial");
     this.fetchTicker();
-    if (this.simLatencyMs > 0) this.setSimLatency(this.simLatencyMs); // re-apply per connection
   }
 
   private onTier(m: ServerMsg) {
@@ -328,12 +328,11 @@ export class FeedClient {
     this.send(encodePing(++this.probeSeq, performance.now() * 1000));
   }
 
-  // RTT for the health report is the network round trip: the raw RTT minus
-  // the time the server held the probe (CPU scheduling / late timers on a
-  // small host), as NTP subtracts server processing time.
-  private onPong(seq: number, tsMicros: number, holdUs: number) {
-    const holdMs = holdUs / 1000;
-    const rtt = Math.max(0, (performance.now() * 1000 - tsMicros) / 1000 - holdMs);
+  private onPong(seq: number, tsMicros: number) {
+    // Debug impairment is injected into the measurement (see setSimLatency).
+    const injected = this.simLatencyMs + (this.spikeNext ? SPIKE_MS : 0);
+    this.spikeNext = false;
+    const rtt = (performance.now() * 1000 - tsMicros) / 1000 + injected;
     if (seq > this.probeSeq || rtt < 0 || rtt > 60_000) {
       this.log("invalid pong ignored", "warn");
       return;
@@ -341,8 +340,8 @@ export class FeedClient {
     if (document.hidden) return; // throttled timers would inflate RTT
     this.meter.add(rtt);
     const { latency, jitter, score, samples } = this.meter;
-    this.send({ type: "NET_REPORT", latencyMs: latency, jitterMs: jitter, rttMs: rtt, serverHoldMs: holdMs, samples });
-    this.queue({ net: { rttMs: rtt, holdMs, latencyMs: latency, jitterMs: jitter, scoreMs: score, samples } });
+    this.send({ type: "NET_REPORT", latencyMs: latency, jitterMs: jitter, rttMs: rtt, simulatedMs: injected, samples });
+    this.queue({ net: { rttMs: rtt, latencyMs: latency, jitterMs: jitter, scoreMs: score, samples } });
   }
 
   private publishRates() {
@@ -433,16 +432,28 @@ export class FeedClient {
     this.send({ type: "SET_TIER_OVERRIDE", tier });
   }
 
+  /**
+   * Simulated latency (debug): added to every measured RTT before the health
+   * report, so the server's automatic tiering sees exactly RTT + ms.
+   *
+   * It is applied in the measurement, not by delaying server packets: on a
+   * hosted backend an unprompted, delayed PONG is held by the edge proxy's TCP
+   * (Nagle + the browser's delayed ACK) for hundreds of ms more, measured on
+   * Render as +250 ms -> 751 ms median. A simulated impairment must not depend
+   * on the hosting provider.
+   */
   private simLatencyMs = 0;
+  private spikeNext = false;
   setSimLatency(ms: number) {
     this.simLatencyMs = ms;
     this.queue({ debug: { simLatencyMs: ms } });
-    this.send({ type: "DEBUG", action: "SIM_LATENCY", ms });
+    this.log(ms ? `simulated latency +${ms} ms added to each RTT` : "simulated latency off", "info");
   }
 
-  /** Delay exactly one PONG by 900 ms: a single outlier the tier must ignore. */
+  /** One sample +900 ms: a single outlier the tier must ignore. */
   spike() {
-    this.send({ type: "DEBUG", action: "SPIKE" });
+    this.spikeNext = true;
+    this.log("spike: next RTT sample +900 ms", "info");
   }
 
   dropPacket(stream: "depth" | "chart") {

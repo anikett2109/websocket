@@ -4,8 +4,7 @@
 //   CHART_DELTA  63 B: baseSeq (i64 slot), open/high/low/close/volume deltas (i64)
 //   DEPTH_DELTA 115 B: baseSeq u32, bestBid i64, bestAsk i64, 10 bid + 10 ask qty deltas (i32)
 //   TRADE_UPDATE 143 B: ltp i64, 10 x (priceDelta i32, signedQty i32, timeDelta i32)
-//   PING         15 B: header only (seq = probe seq, ts = client clock)
-//   PONG         19 B: PING echoed + u32 server hold (µs) beyond any simulated delay
+//   PING/PONG    15 B: header only (seq = probe seq, ts = sender clock, echoed)
 
 export const PacketType = {
   ChartDelta: 1,
@@ -15,7 +14,7 @@ export const PacketType = {
   Pong: 5,
 } as const;
 
-export const Sizes = { header: 15, chart: 63, depth: 115, trade: 143, probe: 15, pong: 19 } as const;
+export const Sizes = { header: 15, chart: 63, depth: 115, trade: 143, probe: 15 } as const;
 export const LEVELS = 10;
 
 export class MalformedPacketError extends Error {}
@@ -58,7 +57,6 @@ export interface Pong {
   kind: "pong";
   seq: number;
   ts: number;
-  holdUs: number; // server-side hold (CPU/timer), subtracted from the RTT
 }
 
 export type Packet = ChartDelta | DepthDelta | TradeUpdate | Pong;
@@ -75,7 +73,7 @@ const expected: Record<number, number> = {
   [PacketType.ChartDelta]: Sizes.chart,
   [PacketType.DepthDelta]: Sizes.depth,
   [PacketType.TradeUpdate]: Sizes.trade,
-  [PacketType.Pong]: Sizes.pong,
+  [PacketType.Pong]: Sizes.probe,
 };
 
 /** Decode one binary frame. Throws MalformedPacketError on any inconsistency. */
@@ -125,7 +123,7 @@ export function decode(buf: ArrayBuffer): Packet {
       return { kind: "trades", newestId: seq, ts, trades };
     }
     default:
-      return { kind: "pong", seq, ts, holdUs: v.getUint32(15, true) };
+      return { kind: "pong", seq, ts };
   }
 }
 

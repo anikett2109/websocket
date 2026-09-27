@@ -201,7 +201,7 @@ type u8 | length u16 (whole packet) | seq u32 | timestamp i64
 | 2 `DEPTH_DELTA` | **115 B** | depth seq (tick) / send time | `baseSeq` u32, `bestBid` i64, `bestAsk` i64, 10 bid Δqty i32, 10 ask Δqty i32 |
 | 3 `TRADE_UPDATE` | **143 B** | newest trade id / newest trade ts | LTP i64, then 10 × (Δprice i32, ±qty i32, Δtime i32) |
 | 4 `PING` | **15 B** | probe seq / client clock (µs) | none (client → server) |
-| 5 `PONG` | **19 B** | the same values echoed | server hold u32 µs: time the server kept the probe beyond any simulated delay |
+| 5 `PONG` | **15 B** | the same values echoed | none (server → client) |
 
 Design notes:
 
@@ -264,7 +264,7 @@ The deltas are additive and may be coalesced, so a packet can never be partially
 
 The app measures and reports; the backend decides (task.txt §3).
 
-1. **Probe.** The app sends a binary `PING(probeSeq, performance.now() µs)` and the server echoes it immediately as a `PONG`. It starts with **3 fast-start probes 200 ms apart**, then sends 1 per second. The network RTT = `now − echoedTimestamp − serverHold` uses only the browser's monotonic clock. The server reports how long it held the probe beyond the intentional simulated delay (CPU scheduling, late timers), and the app subtracts it, as NTP subtracts server processing time: delay = (t4 − t1) − (t3 − t2). **The tier reflects the client's network, not the server's CPU.** A probe is discarded if its seq is in the future, if its RTT is negative or over 60 s, or if it arrives while the tab is hidden (throttled timers would be measured instead of the network).
+1. **Probe.** The app sends a binary `PING(probeSeq, performance.now() µs)` and the server echoes it immediately as a `PONG`. It starts with **3 fast-start probes 200 ms apart**, then sends 1 per second. `RTT = now − echoedTimestamp` uses only the browser's monotonic clock. A probe is discarded if its seq is in the future, if its RTT is negative or over 60 s, or if it arrives while the tab is hidden (throttled timers would be measured instead of the network).
 2. **Health report.** Over the last **W = 5 RTTs**:
    - **latency = median(window)**: the typical round trip.
    - **jitter = MAD = median(|RTTᵢ − latency|)**: the typical deviation.
@@ -320,8 +320,8 @@ These are for demonstration only. They are in the **Debug controls** panel and a
 | Control | Effect |
 |---|---|
 | Force tier: AUTO / FULL / DEGRADED / MINIMAL | Sends `SET_TIER_OVERRIDE`. The effective tier becomes the override. The automatic state machine keeps running, the UI shows what it *would* choose, and AUTO restores it. Also available as `POST /api/debug/clients/:id/tier`. |
-| Simulated latency: off / **+250 ms → DEGRADED** / **+700 ms → MINIMAL** | The server delays this connection's PONGs so the **automatic** tiering reacts. With the measured ~90 ms base, +250 puts L near the middle of the DEGRADED band (≈ 340–400). That leaves room below 600 for the timer lateness of a 0.1-CPU host (see Known limitations). |
-| **Spike (tier should hold)** | Delays exactly one PONG by 900 ms. The median ignores it, which shows the hysteresis working. |
+| Simulated latency: off / **+250 ms → DEGRADED** / **+700 ms → MINIMAL** | The app adds the delay to every measured RTT before the health report, so the server's automatic tiering sees exactly RTT + delay. With the measured ~85 ms base, +250 gives L ≈ 340–430 (the middle of DEGRADED). It's injected into the measurement rather than by delaying server packets: on Render, an unprompted, delayed PONG is held by the edge proxy's TCP (Nagle's algorithm plus the browser's delayed ACK). We measured +250 ms → 751 ms median, but 346 ms when the client happened to send a packet just before. A simulated impairment must not depend on the hosting provider. |
+| **Spike (tier should hold)** | Adds 900 ms to one RTT sample. The median ignores it, which shows the hysteresis working. |
 | Drop depth / chart packet | The server advances its view of the client without sending one packet. The client detects the gap, re-snapshots and resumes, and the event log shows each step. |
 | Kill socket | Closes the socket, then auto-reconnects and resyncs. |
 | Go offline / Resume | Stays disconnected, to show the stale state, until resumed. |
@@ -455,6 +455,6 @@ The frontend is fully static; every route is prerendered. The backend must be **
 - **Book model.** The book is a contiguous tick grid with 10 levels per side, as the packet format requires. Real books can have empty price levels.
 - **RTT includes browser main-thread delay.** If the page is busy, measured latency rises. That is arguably correct for an application-level delivery tier.
 - **Timestamps come from the backend clock.** Timestamps, ids and prices are all derived from it, so a skewed server clock shifts the whole market.
-- **Small hosts pause the server.** On Render's free 0.1 CPU the process is paused whenever its CPU quota runs out. Delayed PONG timers then fired up to ~400 ms late, which made a +250 ms client flap between DEGRADED and MINIMAL. The PONG now carries that hold time and the app subtracts it. What remains uncompensated is time a PING waits in the kernel before a paused process reads it, which is usually small.
+- **Proxy buffering of unprompted server messages.** Behind Render's edge proxy, a server message that isn't an immediate reply to client traffic can be held for up to several hundred ms by TCP's Nagle/delayed-ACK interaction. The RTT probe, an immediate echo, doesn't see this. That's why simulated latency is injected client-side, and why it's worth knowing that live pushes to an otherwise silent client may arrive later than the probe suggests.
 - **Race detector.** `go test -race` needs cgo. It runs in CI on Linux; it could not run on the Windows development machine, which has no C compiler.
 - **No watchlist.** There is only one symbol, so the bonus watchlist reordering isn't implemented.
